@@ -138,7 +138,7 @@ Réponds UNIQUEMENT en JSON valide, sans texte autour :
 
 def extract_order(text: str) -> dict:
     resp = anthropic_client.messages.create(
-        model="claude-sonnet-20241022",
+        model="claude-sonnet-4-6",
         max_tokens=1024,
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": text}],
