@@ -595,11 +595,17 @@ async def handle_admin_correction(correction_text: str, contact: str):
         result["delivery_address"] = address
         pending_orders.pop(token)
 
-        # Recalculate with new items
+        # Keep already confirmed items, only replace missing ones
+        existing_order = pending["order_data"]
+        confirmed_items = existing_order.get("items_info", [])
+        confirmed_amount = sum(i["line_total"] for i in confirmed_items)
+        confirmed_weight = sum(i.get("weight", 0) * i["quantity"] for i in confirmed_items)
+
+        # Search only the corrected/new items
         models, uid = odoo_login()
-        items_info = []
-        total_weight = 0.0
-        total_amount = 0.0
+        new_items_info = list(confirmed_items)  # start with confirmed items
+        total_weight = confirmed_weight
+        total_amount = confirmed_amount
         missing = []
 
         for item in result.get("items", []):
@@ -615,7 +621,7 @@ async def handle_admin_correction(correction_text: str, contact: str):
                 line_total = price * qty
                 total_amount += line_total
                 total_weight += weight * qty
-                items_info.append({
+                new_items_info.append({
                     "product_id": product["id"],
                     "product_name": product["name"],
                     "quantity": qty,
@@ -628,7 +634,7 @@ async def handle_admin_correction(correction_text: str, contact: str):
         shipping_cost, shipping_note = calculate_shipping(address, total_amount, total_weight)
         grand_total = total_amount + shipping_cost
 
-        result["items_info"] = items_info
+        result["items_info"] = new_items_info
         result["missing"] = missing
         result["total_amount"] = total_amount
         result["shipping_cost"] = shipping_cost
@@ -727,14 +733,48 @@ def odoo_login():
 
 
 def find_products(models, uid, name: str) -> list:
-    """Search products by name, return list of matches with details."""
-    ids = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "product.template", "search",
-                            [[["name", "ilike", name], ["sale_ok", "=", True]]], {"limit": 5})
-    if not ids:
-        return []
-    products = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "product.template", "read",
+    """Search products by name with flexible word matching."""
+    def search(domain):
+        ids = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "product.template", "search",
+                                [domain], {"limit": 5})
+        if not ids:
+            return []
+        return models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "product.template", "read",
                                  [ids], {"fields": ["id", "name", "list_price", "weight"]})
-    return products
+
+    # 1. Try exact phrase first
+    results = search([["name", "ilike", name], ["sale_ok", "=", True]])
+    if results:
+        return results
+
+    # 2. Try each word individually and intersect
+    words = [w for w in name.split() if len(w) > 2]
+    if not words:
+        return []
+
+    all_ids = None
+    for word in words:
+        ids = set(p["id"] for p in search([["name", "ilike", word], ["sale_ok", "=", True]]))
+        if all_ids is None:
+            all_ids = ids
+        else:
+            all_ids = all_ids & ids
+
+    if all_ids:
+        return models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "product.template", "read",
+                                 [list(all_ids)], {"fields": ["id", "name", "list_price", "weight"]})
+
+    # 3. Try any word match (union)
+    all_ids = set()
+    for word in words:
+        ids = set(p["id"] for p in search([["name", "ilike", word], ["sale_ok", "=", True]]))
+        all_ids = all_ids | ids
+
+    if all_ids:
+        return models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "product.template", "read",
+                                 [list(all_ids)[:5]], {"fields": ["id", "name", "list_price", "weight"]})
+
+    return []
 
 
 def find_or_create_customer(models, uid, name: str, phone: str) -> int:
