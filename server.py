@@ -310,10 +310,17 @@ async def resolve_items(phone, contact, address, order_data, resolved_items, unr
         product_name = item.get("product_name", "")
         size = item.get("size")
         bags = item.get("bags", 1)
-        query = f"{product_name} {size}" if size else product_name
-        matches = find_products(models, uid, query)
-        if not matches:
-            matches = find_products(models, uid, product_name)
+        # Always search by product name only, then filter by size
+        matches = find_products(models, uid, product_name)
+        # Enrich with TTC price before size filtering
+        for m in matches:
+            m["price_ttc"] = get_price_ttc(models, uid, m["id"], m["list_price"])
+        # If size specified, filter matches by size
+        if size and matches:
+            size_clean = size.lower().replace(" ", "")
+            size_filtered = [m for m in matches if size_clean in m["name"].lower()]
+            if size_filtered:
+                matches = size_filtered
 
         # Enrich with TTC price
         for m in matches:
