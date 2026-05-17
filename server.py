@@ -326,25 +326,58 @@ async def resolve_items(phone, contact, address, order_data, resolved_items, unr
                 "quantity": bags,
                 "original_query": query,
             })
-        elif len(matches) == 1 and (not size or not size or size.lower().replace(" ", "") in matches[0]["name"].lower()):
+        elif len(matches) == 1:
+            # Check if size matches — if not, ask for clarification
             p = matches[0]
-            price_ttc = p["price_ttc"]
-            line_total = price_ttc * bags
-            total_amount += line_total
-            total_weight += p.get("weight", 0) * bags
-            resolved_items.append({
-                "product_id": p["id"],
-                "product_name": p["name"],
-                "quantity": bags,
-                "unit_price": price_ttc,
-                "line_total": line_total,
-                "weight": p.get("weight", 0),
-            })
+            if size and size.lower().replace(" ", "") not in p["name"].lower():
+                # Size doesn't match — show as ambiguous so admin can confirm
+                ambiguous.append({
+                    "query": product_name, "size": size,
+                    "bags": bags, "matches": matches,
+                })
+            else:
+                price_ttc = p["price_ttc"]
+                line_total = price_ttc * bags
+                total_amount += line_total
+                total_weight += p.get("weight", 0) * bags
+                resolved_items.append({
+                    "product_id": p["id"],
+                    "product_name": p["name"],
+                    "quantity": bags,
+                    "unit_price": price_ttc,
+                    "line_total": line_total,
+                    "weight": p.get("weight", 0),
+                })
         else:
-            ambiguous.append({
-                "query": product_name, "size": size,
-                "bags": bags, "matches": matches,
-            })
+            # Multiple matches — if size specified, filter by size first
+            if size:
+                size_clean = size.lower().replace(" ", "")
+                size_matches = [m for m in matches if size_clean in m["name"].lower()]
+                if len(size_matches) == 1:
+                    p = size_matches[0]
+                    price_ttc = p["price_ttc"]
+                    line_total = price_ttc * bags
+                    total_amount += line_total
+                    total_weight += p.get("weight", 0) * bags
+                    resolved_items.append({
+                        "product_id": p["id"],
+                        "product_name": p["name"],
+                        "quantity": bags,
+                        "unit_price": price_ttc,
+                        "line_total": line_total,
+                        "weight": p.get("weight", 0),
+                    })
+                else:
+                    # Still ambiguous even with size filter
+                    ambiguous.append({
+                        "query": product_name, "size": size,
+                        "bags": bags, "matches": size_matches if size_matches else matches,
+                    })
+            else:
+                ambiguous.append({
+                    "query": product_name, "size": size,
+                    "bags": bags, "matches": matches,
+                })
 
     if ambiguous:
         first = ambiguous[0]
