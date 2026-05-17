@@ -101,6 +101,12 @@ async def receive_message(request: Request):
     if msg_type == "text":
         text = message["text"]["body"]
         if phone in waiting_for_address:
+            # Handle YES confirmation of saved address
+            if text.strip().upper() in ("YES", "OUI", "Y"):
+                saved = get_saved_address(phone)
+                if saved:
+                    await handle_address_response(phone, contact, saved)
+                    return {"status": "address_confirmed"}
             await handle_address_response(phone, contact, text)
             return {"status": "address"}
         if phone in waiting_for_clarification:
@@ -715,6 +721,22 @@ async def process_catalog_order(phone: str, contact: str, order: dict):
 
 
 # ── Odoo ───────────────────────────────────────────────────────────────────────
+
+def get_saved_address(phone: str) -> str | None:
+    """Look up saved delivery address for a customer by phone."""
+    try:
+        models, uid = odoo_login()
+        ids = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'res.partner', 'search',
+                                [[['phone', '=', phone]]])
+        if not ids:
+            return None
+        partner = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'res.partner', 'read',
+                                    [ids], {'fields': ['street']})[0]
+        return partner.get('street') or None
+    except Exception as e:
+        log.warning('Could not get saved address: %s', e)
+        return None
+
 
 def odoo_login():
     common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
