@@ -195,15 +195,10 @@ async def notify_admin(order_data: dict, phone: str, contact: str, source: str):
     token = str(uuid.uuid4())[:8]
     pending_orders[token] = {"order_data": order_data, "phone": phone, "contact": contact}
 
-    models, uid = odoo_login()
     lines = []
     missing = []
     for item in order_data.get("items", []):
-        found = find_product(models, uid, item["product_name"])
-        icon  = "✓" if found else "⚠️"
-        if not found:
-            missing.append(item["product_name"])
-        lines.append(f"  {icon} {item['product_name']} × {item.get('quantity', 1)}")
+        lines.append(f"  • {item['product_name']} × {item.get('quantity', 1)}")
 
     source_label = "Catalogue" if source == "catalogue" else "Texte libre"
     msg = (
