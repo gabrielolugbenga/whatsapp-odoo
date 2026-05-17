@@ -827,6 +827,11 @@ def create_sale_order(order_data: dict, phone: str, contact: str, address: str):
                 "product_uom_qty": 1, "price_unit": shipping_cost, "name": "Delivery fee",
             }))
 
+    # Save delivery address on partner
+    if address:
+        models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "res.partner", "write",
+                          [[partner_id], {"street": address}])
+
     oid = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "sale.order", "create", [{
         "partner_id": partner_id, "order_line": lines,
         "note": f"Delivery: {address}" if address else "",
