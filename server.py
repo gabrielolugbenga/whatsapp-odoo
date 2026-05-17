@@ -326,7 +326,7 @@ async def resolve_items(phone, contact, address, order_data, resolved_items, unr
                 "quantity": bags,
                 "original_query": query,
             })
-        elif len(matches) == 1:
+        elif len(matches) == 1 and (not size or not size or size.lower().replace(" ", "") in matches[0]["name"].lower()):
             p = matches[0]
             price_ttc = p["price_ttc"]
             line_total = price_ttc * bags
