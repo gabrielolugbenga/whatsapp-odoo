@@ -1,4 +1,4 @@
-"""
+A"""
 WhatsApp → Claude → Odoo 19
 Avec validation manuelle OUI/NON et support catalogue WhatsApp
 
@@ -9,6 +9,8 @@ import os
 import json
 import logging
 import xmlrpc.client
+import ssl
+ssl._create_default_https_context = ssl._create_unverified_context
 import uuid
 from dotenv import load_dotenv
 
