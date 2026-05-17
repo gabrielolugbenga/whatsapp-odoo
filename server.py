@@ -162,7 +162,9 @@ async def process_text_order(phone: str, contact: str, text: str):
         )
         return
 
+    log.info("AVANT NOTIFY ADMIN")
     await notify_admin(order_data, phone, contact, source="texte")
+    log.info("APRES NOTIFY ADMIN")
 
 
 # ── Catalogue WhatsApp ─────────────────────────────────────────────────────────
