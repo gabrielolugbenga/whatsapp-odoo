@@ -9,8 +9,6 @@ import os
 import json
 import logging
 import xmlrpc.client
-import ssl
-ssl._create_default_https_context = ssl._create_unverified_context
 import uuid
 from dotenv import load_dotenv
 
@@ -140,7 +138,7 @@ Réponds UNIQUEMENT en JSON valide, sans texte autour :
 
 def extract_order(text: str) -> dict:
     resp = anthropic_client.messages.create(
-        model="claude-sonnet-4-6",
+        model="claude-sonnet-4-20250514",
         max_tokens=1024,
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": text}],
@@ -162,9 +160,7 @@ async def process_text_order(phone: str, contact: str, text: str):
         )
         return
 
-    log.info("AVANT NOTIFY ADMIN")
     await notify_admin(order_data, phone, contact, source="texte")
-    log.info("APRES NOTIFY ADMIN")
 
 
 # ── Catalogue WhatsApp ─────────────────────────────────────────────────────────
@@ -195,10 +191,15 @@ async def notify_admin(order_data: dict, phone: str, contact: str, source: str):
     token = str(uuid.uuid4())[:8]
     pending_orders[token] = {"order_data": order_data, "phone": phone, "contact": contact}
 
+    models, uid = odoo_login()
     lines = []
     missing = []
     for item in order_data.get("items", []):
-        lines.append(f"  • {item['product_name']} × {item.get('quantity', 1)}")
+        found = find_product(models, uid, item["product_name"])
+        icon  = "✓" if found else "⚠️"
+        if not found:
+            missing.append(item["product_name"])
+        lines.append(f"  {icon} {item['product_name']} × {item.get('quantity', 1)}")
 
     source_label = "Catalogue" if source == "catalogue" else "Texte libre"
     msg = (
