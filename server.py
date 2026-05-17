@@ -697,7 +697,7 @@ def find_products(models, uid, name: str) -> list:
     if results:
         return results
 
-    words = [w for w in name.split() if len(w) > 2]
+    words = [w for w in name.split() if len(w) > 2 and not re.match(r"^[0-9]+[kgKGlLmM]+$", w)]
     if not words:
         return []
 
