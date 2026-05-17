@@ -1,16 +1,17 @@
 """
 WhatsApp → Claude → Odoo 19
-Avec validation manuelle OUI/NON et support catalogue WhatsApp
-
-pip install fastapi uvicorn httpx anthropic python-dotenv
+Version debug avec logs détaillés
 """
 
 import os
 import json
 import logging
 import xmlrpc.client
+import ssl
 import uuid
 from dotenv import load_dotenv
+
+ssl._create_default_https_context = ssl._create_unverified_context
 
 import httpx
 import anthropic
@@ -38,8 +39,12 @@ VERIFY_TOKEN = os.environ["VERIFY_TOKEN"]
 ADMIN_PHONE  = os.environ.get("ADMIN_PHONE", "")
 CONFIDENCE_THRESHOLD = float(os.environ.get("CONFIDENCE_THRESHOLD", 0.75))
 
-# Commandes en attente de validation admin
-# { token: { "order_data": ..., "phone": ..., "contact": ... } }
+log.info("=== DEMARRAGE SERVEUR ===")
+log.info("ADMIN_PHONE: %s", ADMIN_PHONE)
+log.info("ODOO_URL: %s", ODOO_URL)
+log.info("ODOO_USER: %s", ODOO_USER)
+log.info("WA_PHONE_ID: %s", WA_PHONE_ID)
+
 pending_orders: dict = {}
 
 
@@ -56,21 +61,26 @@ async def verify(request: Request):
 @app.post("/webhook")
 async def receive_message(request: Request):
     body = await request.json()
-    log.info("Webhook: %s", json.dumps(body, ensure_ascii=False))
+    log.info("=== WEBHOOK RECU ===")
 
     try:
         changes = body["entry"][0]["changes"][0]["value"]
         message = changes["messages"][0]
     except (KeyError, IndexError):
+        log.info("Pas de message dans le webhook, ignoré")
         return {"status": "ignored"}
 
     phone    = message["from"]
     contact  = changes.get("contacts", [{}])[0].get("profile", {}).get("name", phone)
     msg_type = message.get("type")
 
+    log.info("Message de: %s (%s), type: %s", contact, phone, msg_type)
+    log.info("ADMIN_PHONE comparaison: '%s' == '%s' : %s", phone, ADMIN_PHONE, phone == ADMIN_PHONE)
+
     # Réponse OUI/NON de l'admin
     if phone == ADMIN_PHONE and msg_type == "text":
         txt = message["text"]["body"].strip().upper()
+        log.info("Message admin recu: %s", txt)
         if txt.startswith("OUI") or txt.startswith("NON"):
             await handle_admin_validation(txt)
             return {"status": "admin"}
@@ -91,6 +101,7 @@ async def receive_message(request: Request):
 # ── Validation admin ───────────────────────────────────────────────────────────
 
 async def handle_admin_validation(text: str):
+    log.info("=== VALIDATION ADMIN: %s ===", text)
     if not pending_orders:
         await send_whatsapp(ADMIN_PHONE, "Aucune commande en attente.")
         return
@@ -102,17 +113,22 @@ async def handle_admin_validation(text: str):
     contact    = pending["contact"]
 
     if text.startswith("OUI"):
-        result = create_sale_order(order_data, phone, contact)
-        if result is None:
-            await send_whatsapp(ADMIN_PHONE, "Erreur : aucun produit reconnu dans Odoo.")
-            await send_whatsapp(phone, "Désolé, nous n'avons pas pu traiter votre commande. Nous vous recontactons.")
-            return
-        order_name, missing = result
-        await send_whatsapp(phone, format_client_confirmation(order_name, order_data, missing))
-        await send_whatsapp(ADMIN_PHONE, f"Commande {order_name} créée dans Odoo.")
+        log.info("Validation OUI - création commande Odoo")
+        try:
+            result = create_sale_order(order_data, phone, contact)
+            if result is None:
+                await send_whatsapp(ADMIN_PHONE, "Erreur : aucun produit reconnu dans Odoo.")
+                await send_whatsapp(phone, "Désolé, nous n'avons pas pu traiter votre commande.")
+                return
+            order_name, missing = result
+            await send_whatsapp(phone, format_client_confirmation(order_name, order_data, missing))
+            await send_whatsapp(ADMIN_PHONE, f"Commande {order_name} créée dans Odoo.")
+        except Exception as e:
+            log.error("ERREUR création commande: %s", e)
+            await send_whatsapp(ADMIN_PHONE, f"Erreur Odoo: {str(e)}")
     else:
         await send_whatsapp(ADMIN_PHONE, "Commande ignorée.")
-        await send_whatsapp(phone, "Votre commande n'a pas pu être traitée. Nous vous recontactons.")
+        await send_whatsapp(phone, "Votre commande n'a pas pu être traitée.")
 
 
 # ── Texte libre ────────────────────────────────────────────────────────────────
@@ -133,34 +149,48 @@ Réponds UNIQUEMENT en JSON valide, sans texte autour :
 
 - Pas de commande : confidence=0, items=[].
 - Incertain : confidence < 0.6.
-- Ne complète jamais des infos absentes.
 """
 
 def extract_order(text: str) -> dict:
+    log.info("=== APPEL CLAUDE ===")
     resp = anthropic_client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=1024,
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": text}],
     )
-    return json.loads(resp.content[0].text.strip())
+    raw = resp.content[0].text.strip()
+    log.info("Claude response: %s", raw)
+    return json.loads(raw)
 
 async def process_text_order(phone: str, contact: str, text: str):
+    log.info("=== PROCESS TEXT ORDER ===")
     try:
         order_data = extract_order(text)
-    except json.JSONDecodeError:
+    except Exception as e:
+        log.error("ERREUR extract_order: %s", e)
         await send_whatsapp(phone, "Une erreur est survenue, veuillez réessayer.")
         return
 
-    if not order_data.get("items") or order_data.get("confidence", 0) < CONFIDENCE_THRESHOLD:
+    confidence = order_data.get("confidence", 0)
+    items = order_data.get("items", [])
+    log.info("Confidence: %s, Items: %s", confidence, items)
+
+    if not items or confidence < CONFIDENCE_THRESHOLD:
+        log.info("Commande non comprise, demande clarification")
         await send_whatsapp(phone,
             "Je n'ai pas bien compris votre commande.\n"
-            "Pouvez-vous préciser les produits et quantités ?\n\n"
-            "Exemple : '3 cartons d'eau et 2 packs de jus d'orange'"
+            "Pouvez-vous préciser les produits et quantités ?"
         )
         return
 
-    await notify_admin(order_data, phone, contact, source="texte")
+    log.info("=== APPEL NOTIFY ADMIN ===")
+    try:
+        await notify_admin(order_data, phone, contact, source="texte")
+        log.info("=== NOTIFY ADMIN TERMINE ===")
+    except Exception as e:
+        log.error("ERREUR notify_admin: %s", e)
+        await send_whatsapp(phone, "Une erreur est survenue, veuillez réessayer.")
 
 
 # ── Catalogue WhatsApp ─────────────────────────────────────────────────────────
@@ -188,18 +218,13 @@ async def process_catalog_order(phone: str, contact: str, order: dict):
 # ── Notification admin ─────────────────────────────────────────────────────────
 
 async def notify_admin(order_data: dict, phone: str, contact: str, source: str):
+    log.info("=== NOTIFY ADMIN START ===")
     token = str(uuid.uuid4())[:8]
     pending_orders[token] = {"order_data": order_data, "phone": phone, "contact": contact}
 
-    models, uid = odoo_login()
     lines = []
-    missing = []
     for item in order_data.get("items", []):
-        found = find_product(models, uid, item["product_name"])
-        icon  = "✓" if found else "⚠️"
-        if not found:
-            missing.append(item["product_name"])
-        lines.append(f"  {icon} {item['product_name']} × {item.get('quantity', 1)}")
+        lines.append(f"  • {item['product_name']} × {item.get('quantity', 1)}")
 
     source_label = "Catalogue" if source == "catalogue" else "Texte libre"
     msg = (
@@ -211,21 +236,25 @@ async def notify_admin(order_data: dict, phone: str, contact: str, source: str):
         msg += f"\nAdresse : {order_data['delivery_address']}"
     if order_data.get("notes"):
         msg += f"\nNote : {order_data['notes']}"
-    if missing:
-        msg += f"\n\nProduits non trouvés dans Odoo : {', '.join(missing)}"
     msg += "\n\nRépondre OUI pour valider ou NON pour ignorer."
 
+    log.info("Envoi notification admin vers: %s", ADMIN_PHONE)
+    log.info("Message admin: %s", msg)
     await send_whatsapp(ADMIN_PHONE, msg)
+    log.info("Notification admin envoyée")
     await send_whatsapp(phone, "Commande reçue. Nous la traitons et vous confirmons rapidement.")
+    log.info("=== NOTIFY ADMIN END ===")
 
 
 # ── Odoo ───────────────────────────────────────────────────────────────────────
 
 def odoo_login():
+    log.info("Connexion Odoo: %s / %s", ODOO_URL, ODOO_USER)
     common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
     uid = common.authenticate(ODOO_DB, ODOO_USER, ODOO_PASSWORD, {})
     if not uid:
-        raise RuntimeError("Authentification Odoo échouée")
+        raise RuntimeError(f"Authentification Odoo échouée pour {ODOO_USER}")
+    log.info("Odoo connecté, UID: %s", uid)
     return xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object"), uid
 
 def find_or_create_customer(models, uid, name: str, phone: str) -> int:
@@ -288,6 +317,7 @@ def format_client_confirmation(order_name: str, order_data: dict, missing: list)
     return msg
 
 async def send_whatsapp(phone: str, text: str):
+    log.info("=== SEND WHATSAPP vers %s ===", phone)
     url = f"https://graph.facebook.com/v19.0/{WA_PHONE_ID}/messages"
     async with httpx.AsyncClient() as client:
         r = await client.post(url,
@@ -295,7 +325,7 @@ async def send_whatsapp(phone: str, text: str):
                   "type": "text", "text": {"body": text}},
             headers={"Authorization": f"Bearer {WA_TOKEN}"},
         )
-        log.info("WA → %s : %s", r.status_code, r.text)
+        log.info("WA send to %s → %s : %s", phone, r.status_code, r.text)
 
 
 # ── Démarrage ──────────────────────────────────────────────────────────────────
