@@ -320,7 +320,7 @@ async def resolve_items(phone, contact, address, order_data, resolved_items, mis
         size_hint = f" ({first['size']})" if first.get("size") else ""
         await send_whatsapp(phone,
             f"Which *{first['query']}{size_hint}* did you mean?\n\n{options}\n\n"
-            "Reply with the number or product name."
+            "Reply with the number or product name, or *0* if none match and we will get in touch to confirm."
         )
         waiting_for_clarification[phone] = {
             "order_data": order_data, "contact": contact, "address": address,
@@ -354,6 +354,11 @@ async def handle_clarification_response(phone: str, contact: str, text: str):
 
     chosen = None
     t = text.strip()
+    if t == "0":
+        waiting_for_clarification.pop(phone, None)
+        await send_whatsapp(phone, "No problem! Our team will get in touch to confirm your order. 😊")
+        await send_whatsapp(ADMIN_PHONE, f"⚠️ Customer {contact} ({phone}) could not find a matching product. Please contact them directly.")
+        return
     if t.isdigit():
         n = int(t)
         if 1 <= n <= len(matches):
