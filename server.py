@@ -693,7 +693,7 @@ def find_products(models, uid, name: str) -> list:
         return models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "product.template", "read",
                                  [ids], {"fields": ["id", "name", "list_price", "weight", "taxes_id"]})
 
-    results = search([["name", "ilike", name], ["sale_ok", "=", True]])
+    results = search([["name", "ilike", name], ["sale_ok", "=", True], ["is_published", "=", True]])
     if results:
         return results
 
@@ -703,7 +703,7 @@ def find_products(models, uid, name: str) -> list:
 
     all_ids = None
     for word in words:
-        ids = {p["id"] for p in search([["name", "ilike", word], ["sale_ok", "=", True]])}
+        ids = {p["id"] for p in search([["name", "ilike", word], ["sale_ok", "=", True], ["is_published", "=", True]])}
         all_ids = ids if all_ids is None else all_ids & ids
     if all_ids:
         return models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "product.template", "read",
@@ -711,7 +711,7 @@ def find_products(models, uid, name: str) -> list:
 
     all_ids = set()
     for word in words:
-        all_ids |= {p["id"] for p in search([["name", "ilike", word], ["sale_ok", "=", True]])}
+        all_ids |= {p["id"] for p in search([["name", "ilike", word], ["sale_ok", "=", True], ["is_published", "=", True]])}
     if all_ids:
         return models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "product.template", "read",
                                  [list(all_ids)[:5]], {"fields": ["id", "name", "list_price", "weight", "taxes_id"]})
@@ -757,7 +757,7 @@ def create_sale_order(order_data: dict, phone: str, contact: str, address: str):
     if shipping_cost > 0:
         delivery_ids = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD, "product.product", "search",
-            [[["name", "ilike", "Livraison"], ["sale_ok", "=", True]]], {"limit": 1}
+            [[["name", "ilike", "Livraison"], ["sale_ok", "=", True], ["is_published", "=", True]]], {"limit": 1}
         )
         if delivery_ids:
             lines.append((0, 0, {
