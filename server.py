@@ -161,6 +161,7 @@ def extract_order(text: str) -> dict:
     )
     raw = resp.content[0].text.strip()
     log.info("Claude response: %s", raw)
+    raw = raw.replace("```json", "").replace("```", "").strip()
     return json.loads(raw)
 
 async def process_text_order(phone: str, contact: str, text: str):
