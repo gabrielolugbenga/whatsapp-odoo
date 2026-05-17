@@ -727,7 +727,7 @@ def odoo_login():
 def find_products(models, uid, name: str) -> list:
     def search(domain):
         ids = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "product.template", "search",
-                                [domain], {"limit": 5})
+                                [domain], {"limit": 20})
         if not ids:
             return []
         return models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "product.template", "read",
