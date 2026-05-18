@@ -102,6 +102,23 @@ async def receive_message(request: Request):
         txt = message["text"]["body"].strip()
         txt_up = txt.upper()
 
+        # HISTORY command
+        if txt_up.startswith("HISTORY"):
+            await handle_history()
+            return {"status": "history"}
+
+        # EOD response
+        if txt_up in ("YES", "OUI") and not pending_orders and not admin_waiting_idf and not admin_clarification:
+            await send_whatsapp(ADMIN_PHONE, "✅ Great! Have a good evening. 🌙")
+            return {"status": "eod_yes"}
+
+        if txt_up in ("NO", "NON") and not pending_orders and not admin_waiting_idf and not admin_clarification:
+            await send_whatsapp(ADMIN_PHONE,
+                "Please log missing orders via CMD before closing.\n\n"
+                "Type CMD followed by the order to get started."
+            )
+            return {"status": "eod_no"}
+
         # CMD flow
         if txt_up.startswith("CMD"):
             await handle_cmd_start(txt)
@@ -580,6 +597,41 @@ async def handle_admin_correction(correction_text: str):
 
 # ── CMD flow ───────────────────────────────────────────────────────────────────
 
+async def handle_history():
+    """Show today's orders created via WhatsApp."""
+    try:
+        models, uid = odoo_login()
+        import datetime
+        today = datetime.date.today().strftime("%Y-%m-%d")
+        ids = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD, "sale.order", "search",
+            [[["client_order_ref", "like", "WA-"],
+              ["date_order", ">=", f"{today} 00:00:00"]]],
+        )
+        if not ids:
+            await send_whatsapp(ADMIN_PHONE, "📋 No orders logged today via WhatsApp.")
+            return
+
+        orders = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD, "sale.order", "read",
+            [ids], {"fields": ["name", "partner_id", "amount_total", "state"]}
+        )
+        status_map = {"draft": "⏳", "sent": "📤", "sale": "✅", "cancel": "❌"}
+        lines = "\n".join(
+            f"{status_map.get(o['state'], '?')} {o['name']} — "
+            f"{o['partner_id'][1]} — €{o['amount_total']:.2f}"
+            for o in orders
+        )
+        total = sum(o["amount_total"] for o in orders)
+        await send_whatsapp(ADMIN_PHONE,
+            f"📋 *Today's orders ({len(orders)})*\n\n{lines}\n\n"
+            f"💳 *Total: €{total:.2f}*"
+        )
+    except Exception as e:
+        log.error("History error: %s", e)
+        await send_whatsapp(ADMIN_PHONE, f"Could not fetch history: {str(e)}")
+
+
 async def handle_cmd_start(txt: str):
     order_text = txt[3:].strip().lstrip(":").strip()
     if not order_text:
@@ -601,29 +653,116 @@ async def handle_cmd_start(txt: str):
     cmd_pending["step"]       = "customer"
     items_txt = format_items_preview(result)
     await send_whatsapp(ADMIN_PHONE,
-        f"Order noted:\n{items_txt}\n\nWhich customer? Reply with their WhatsApp number."
+        f"Order noted:\n{items_txt}\n\n"
+        "Customer name or phone number?"
     )
 
 
 async def handle_cmd_customer(txt: str):
-    customer_phone = re.sub(r"[^\d]", "", txt)
-    if not customer_phone:
-        await send_whatsapp(ADMIN_PHONE, "Please provide a valid phone number. Example: 33768314654")
+    """Handle customer search by name or phone number."""
+    t = txt.strip()
+    # Check if it's a number selection from previous search
+    if t.isdigit() and "cmd_customer_results" in cmd_pending:
+        results = cmd_pending.pop("cmd_customer_results")
+        n = int(t)
+        if 1 <= n <= len(results):
+            chosen = results[n - 1]
+            await _process_cmd_with_customer(chosen["phone"], chosen["name"])
+        else:
+            await send_whatsapp(ADMIN_PHONE, f"Please reply with a number between 1 and {len(results)}.")
+            cmd_pending["cmd_customer_results"] = results
         return
 
+    # Check if it's a phone number
+    digits_only = re.sub(r"[^\d]", "", t)
+    if len(digits_only) >= 8:
+        # Search by phone
+        try:
+            models, uid = odoo_login()
+            ids = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "res.partner", "search",
+                                    [[["phone", "like", digits_only[-8:]]]])
+            if ids:
+                partners = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "res.partner", "read",
+                                             [ids[:3]], {"fields": ["name", "phone"]})
+                if len(partners) == 1:
+                    await _process_cmd_with_customer(digits_only, partners[0]["name"])
+                else:
+                    options = "\n".join(f"  {i+1}. {p['name']} — {p['phone']}"
+                                        for i, p in enumerate(partners))
+                    cmd_pending["cmd_customer_results"] = [
+                        {"name": p["name"], "phone": re.sub(r"[^\d]", "", p["phone"] or digits_only)}
+                        for p in partners
+                    ]
+                    await send_whatsapp(ADMIN_PHONE,
+                        f"Found {len(partners)} customers:\n\n{options}\n\nReply with number."
+                    )
+            else:
+                # New customer
+                await _process_cmd_with_customer(digits_only, digits_only)
+        except Exception as e:
+            log.error("CMD customer search error: %s", e)
+            await _process_cmd_with_customer(digits_only, digits_only)
+    else:
+        # Search by name
+        try:
+            models, uid = odoo_login()
+            ids = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "res.partner", "search",
+                                    [[["name", "ilike", t], ["customer_rank", ">", 0]]], {"limit": 5})
+            if ids:
+                partners = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "res.partner", "read",
+                                             [ids], {"fields": ["name", "phone"]})
+                # Filter out partners without phone
+                partners = [p for p in partners if p.get("phone")]
+                if not partners:
+                    await send_whatsapp(ADMIN_PHONE,
+                        f"No customer found with name *{t}* and a phone number.\n"
+                        "Please provide their phone number directly."
+                    )
+                    return
+                if len(partners) == 1:
+                    phone = re.sub(r"[^\d]", "", partners[0]["phone"])
+                    await _process_cmd_with_customer(phone, partners[0]["name"])
+                else:
+                    options = "\n".join(f"  {i+1}. {p['name']} — {p['phone']}"
+                                        for i, p in enumerate(partners))
+                    cmd_pending["cmd_customer_results"] = [
+                        {"name": p["name"], "phone": re.sub(r"[^\d]", "", p["phone"])}
+                        for p in partners
+                    ]
+                    await send_whatsapp(ADMIN_PHONE,
+                        f"Found {len(partners)} customers named *{t}*:\n\n{options}\n\n"
+                        "Reply with number, or type their phone if not listed."
+                    )
+            else:
+                await send_whatsapp(ADMIN_PHONE,
+                    f"No customer found with name *{t}*.\n"
+                    "Please provide their phone number directly."
+                )
+        except Exception as e:
+            log.error("CMD name search error: %s", e)
+            await send_whatsapp(ADMIN_PHONE, "Search error. Please provide their phone number directly.")
+
+
+async def _process_cmd_with_customer(customer_phone: str, customer_name: str):
+    """Continue CMD flow once customer is identified."""
     order_data = cmd_pending.get("order_data", {})
     order_data["customer_phone"] = customer_phone
-    order_data["customer_name"]  = customer_phone
+    order_data["customer_name"]  = customer_name
 
     idf = get_customer_idf(customer_phone)
     if idf is None:
         cmd_pending["step"] = "idf"
         await send_whatsapp(ADMIN_PHONE,
-            f"Customer: {customer_phone}\nIs this customer in *IDF*? Reply *YES* or *NO*"
+            f"Customer: *{customer_name}* ({customer_phone})\n\n"
+            "Is this customer in *IDF*? Reply *YES* or *NO*"
         )
     else:
+        idf_label = "IDF ✓" if idf else "Outside IDF ✓"
+        await send_whatsapp(ADMIN_PHONE,
+            f"Customer: *{customer_name}* ({customer_phone}) — {idf_label}\n\nProcessing..."
+        )
         cmd_pending.clear()
-        await process_order_with_idf(order_data, customer_phone, customer_phone, idf)
+        await process_order_with_idf(order_data, customer_phone, customer_name, idf)
 
 
 async def handle_cmd_idf(txt: str):
@@ -924,3 +1063,27 @@ async def send_whatsapp(phone: str, text: str):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
+# ── End of day reminder ────────────────────────────────────────────────────────
+
+@app.on_event("startup")
+async def schedule_eod_reminder():
+    asyncio.create_task(eod_reminder_loop())
+
+async def eod_reminder_loop():
+    """Send end of day reminder every day at 19h CET."""
+    import datetime
+    while True:
+        now = datetime.datetime.now()
+        # Target 19:00 CET (UTC+1 or UTC+2 in summer)
+        target = now.replace(hour=18, minute=0, second=0, microsecond=0)  # 18 UTC = 19 CET
+        if now >= target:
+            target += datetime.timedelta(days=1)
+        wait_seconds = (target - now).total_seconds()
+        log.info("EOD reminder scheduled in %.0f seconds", wait_seconds)
+        await asyncio.sleep(wait_seconds)
+        await send_whatsapp(ADMIN_PHONE,
+            "⏰ *End of day check*\n\n"
+            "Have you logged all orders today?\n\n"
+            "Reply *YES* or *NO*"
+        )
