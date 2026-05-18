@@ -801,11 +801,73 @@ async def handle_payment_response(phone: str, text: str):
         await send_whatsapp(phone, f"✅ *Cash on delivery* for {order_name}.\nTotal: €{total:.2f}\n\nThank you! 🙏")
         await send_whatsapp(ADMIN_PHONE, f"💵 {order_name}: *Cash on delivery* — €{total:.2f}")
     elif choice == "3":
-        await send_whatsapp(phone, f"✅ Payment link requested for {order_name} (€{total:.2f}).\nWe will send it shortly! ⏳")
-        await send_whatsapp(ADMIN_PHONE, f"🔗 {order_name}: *Payment link* — €{total:.2f}\nPlease send the payment link.")
+        # Generate Mollie payment link
+        await send_whatsapp(phone, "⏳ Generating your payment link...")
+        payment_url = await create_mollie_payment(order_name, total, phone)
+        if payment_url:
+            await send_whatsapp(phone,
+                f"💳 *Payment link for {order_name}*\n\n"
+                f"Total: €{total:.2f}\n\n"
+                f"👉 {payment_url}\n\n"
+                "This link expires in 24 hours."
+            )
+            await send_whatsapp(ADMIN_PHONE,
+                f"🔗 {order_name}: Payment link sent to customer — €{total:.2f}"
+            )
+        else:
+            await send_whatsapp(phone,
+                "Sorry, we could not generate the payment link. "
+                "Our team will send it to you shortly."
+            )
+            await send_whatsapp(ADMIN_PHONE,
+                f"⚠️ {order_name}: Could not generate Mollie payment link — €{total:.2f}\n"
+                "Please send manually."
+            )
     else:
         await send_whatsapp(phone, "Please reply:\n1️⃣ Card on delivery\n2️⃣ Cash on delivery\n3️⃣ Payment link")
         waiting_for_payment[phone] = pending
+
+
+async def create_mollie_payment(order_name: str, amount: float, customer_phone: str) -> str | None:
+    """Create a Mollie payment and return the checkout URL."""
+    mollie_key = os.environ.get("MOLLIE_API_KEY", "")
+    webhook_url = os.environ.get("MOLLIE_WEBHOOK_URL", "")
+
+    if not mollie_key:
+        log.error("MOLLIE_API_KEY not set")
+        return None
+
+    payload = {
+        "amount": {
+            "currency": "EUR",
+            "value": f"{amount:.2f}"
+        },
+        "description": f"Africomfort Foods — {order_name}",
+        "redirectUrl": "https://africomfort-foods.odoo.com",
+        "webhookUrl": webhook_url,
+        "metadata": {
+            "order_name": order_name,
+            "customer_phone": customer_phone
+        }
+    }
+
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.post(
+                "https://api.mollie.com/v2/payments",
+                json=payload,
+                headers={"Authorization": f"Bearer {mollie_key}"}
+            )
+            log.info("Mollie response: %s %s", r.status_code, r.text)
+            if r.status_code == 201:
+                data = r.json()
+                return data["_links"]["checkout"]["href"]
+            else:
+                log.error("Mollie error: %s", r.text)
+                return None
+    except Exception as e:
+        log.error("Mollie exception: %s", e)
+        return None
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -1044,6 +1106,60 @@ def create_sale_order(order_data: dict, phone: str, contact: str):
     rec = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "sale.order", "read",
                             [[oid]], {"fields": ["name"]})[0]
     return rec["name"], missing
+
+
+@app.post("/mollie-webhook")
+async def mollie_webhook(request: Request):
+    """Receive payment status updates from Mollie."""
+    body = await request.form()
+    payment_id = body.get("id")
+
+    if not payment_id:
+        return {"status": "ignored"}
+
+    mollie_key = os.environ.get("MOLLIE_API_KEY", "")
+
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(
+                f"https://api.mollie.com/v2/payments/{payment_id}",
+                headers={"Authorization": f"Bearer {mollie_key}"}
+            )
+            payment = r.json()
+
+        status        = payment.get("status")
+        metadata      = payment.get("metadata", {})
+        order_name    = metadata.get("order_name", "")
+        customer_phone = metadata.get("customer_phone", "")
+        amount        = payment.get("amount", {}).get("value", "0")
+
+        log.info("Mollie payment %s status: %s", payment_id, status)
+
+        if status == "paid":
+            await send_whatsapp(customer_phone,
+                f"✅ *Payment received — {order_name}*\n\n"
+                f"Amount: €{amount}\n\n"
+                "Thank you! Your order is confirmed and will be processed shortly. 🙏"
+            )
+            await send_whatsapp(ADMIN_PHONE,
+                f"💰 *Payment received* — {order_name}\n"
+                f"Customer: {customer_phone}\n"
+                f"Amount: €{amount}"
+            )
+        elif status == "failed" or status == "expired" or status == "canceled":
+            await send_whatsapp(customer_phone,
+                f"❌ Payment {status} for {order_name}.\n\n"
+                "Please try again or contact us for assistance."
+            )
+            await send_whatsapp(ADMIN_PHONE,
+                f"⚠️ Payment {status} — {order_name} (€{amount})\n"
+                f"Customer: {customer_phone}"
+            )
+
+    except Exception as e:
+        log.error("Mollie webhook error: %s", e)
+
+    return {"status": "ok"}
 
 
 # ── WhatsApp ───────────────────────────────────────────────────────────────────
