@@ -1,6 +1,6 @@
 """
 WhatsApp → Claude → Odoo 19
-Phase 1 - Version complète avec prix TTC et process complet
+Nouvelle architecture : bot silencieux + timer 5min + tout côté admin
 """
 
 import os
@@ -10,6 +10,7 @@ import xmlrpc.client
 import ssl
 import uuid
 import re
+import asyncio
 from dotenv import load_dotenv
 
 ssl._create_default_https_context = ssl._create_unverified_context
@@ -38,7 +39,7 @@ WA_TOKEN     = os.environ["WHATSAPP_TOKEN"]
 WA_PHONE_ID  = os.environ["WHATSAPP_PHONE_ID"]
 VERIFY_TOKEN = os.environ["VERIFY_TOKEN"]
 ADMIN_PHONE  = os.environ.get("ADMIN_PHONE", "")
-CONFIDENCE_THRESHOLD = float(os.environ.get("CONFIDENCE_THRESHOLD", 0.75))
+TIMER_SECONDS = int(os.environ.get("TIMER_SECONDS", 300))  # 5 minutes
 
 IDF_PREFIXES = ("75", "77", "78", "91", "92", "93", "94", "95")
 IDF_FREE_DELIVERY_THRESHOLD = 100.0
@@ -47,14 +48,29 @@ GLS_BASE = 9.0
 GLS_PER_KG = 0.65
 GLS_MAX_WEIGHT = 30.0
 
-log.info("=== SERVER START === ADMIN: %s", ADMIN_PHONE)
+log.info("=== SERVER START === ADMIN: %s TIMER: %ss", ADMIN_PHONE, TIMER_SECONDS)
 
 # ── State ──────────────────────────────────────────────────────────────────────
 
+# { phone: { "messages": [...], "contact": str, "timer_task": asyncio.Task } }
+client_buffers: dict = {}
+
+# { token: { order_data, phone, contact } }
 pending_orders: dict = {}
-waiting_for_address: dict = {}
+
+# { phone: { order_name, total, order_data } }
 waiting_for_payment: dict = {}
-waiting_for_clarification: dict = {}
+
+# Admin clarification states
+# { "order_data": ..., "phone": ..., "contact": ..., "ambiguous": [...], ... }
+admin_clarification: dict = {}
+
+# Admin IDF question
+# { "order_data": ..., "phone": ..., "contact": ... }
+admin_waiting_idf: dict = {}
+
+# CMD flow
+cmd_pending: dict = {}  # { "order_data": ..., "step": "customer"|"address" }
 
 
 # ── Webhook ────────────────────────────────────────────────────────────────────
@@ -81,9 +97,35 @@ async def receive_message(request: Request):
     msg_type = message.get("type")
     log.info("From: %s (%s) type: %s", contact, phone, msg_type)
 
+    # ── Admin messages ─────────────────────────────────────────────────────────
     if phone == ADMIN_PHONE and msg_type == "text":
         txt = message["text"]["body"].strip()
         txt_up = txt.upper()
+
+        # CMD flow
+        if txt_up.startswith("CMD"):
+            await handle_cmd_start(txt)
+            return {"status": "cmd"}
+
+        if cmd_pending.get("step") == "customer":
+            await handle_cmd_customer(txt)
+            return {"status": "cmd_customer"}
+
+        if cmd_pending.get("step") == "idf":
+            await handle_cmd_idf(txt)
+            return {"status": "cmd_idf"}
+
+        # IDF question for new customer
+        if admin_waiting_idf:
+            await handle_admin_idf(txt)
+            return {"status": "admin_idf"}
+
+        # Product clarification
+        if admin_clarification:
+            await handle_admin_clarification(txt)
+            return {"status": "admin_clarification"}
+
+        # Validation
         if txt_up.startswith("OUI") or txt_up.startswith("YES"):
             await handle_admin_validation("OUI")
             return {"status": "admin_yes"}
@@ -94,457 +136,299 @@ async def receive_message(request: Request):
             await handle_admin_correction(txt)
             return {"status": "admin_correction"}
 
+    # ── Catalog order ──────────────────────────────────────────────────────────
     if msg_type == "order":
-        await process_catalog_order(phone, contact, message["order"])
+        await buffer_message(phone, contact, f"[CATALOG ORDER: {json.dumps(message['order'])}]")
         return {"status": "catalog"}
 
+    # ── Client text message ────────────────────────────────────────────────────
     if msg_type == "text":
         text = message["text"]["body"]
-        if phone in waiting_for_address:
-            # Handle YES confirmation of saved address
-            if text.strip().upper() in ("YES", "OUI", "Y"):
-                saved = get_saved_address(phone)
-                if saved:
-                    await handle_address_response(phone, contact, saved)
-                    return {"status": "address_confirmed"}
-            await handle_address_response(phone, contact, text)
-            return {"status": "address"}
-        if phone in waiting_for_clarification:
-            await handle_clarification_response(phone, contact, text)
-            return {"status": "clarification"}
+
+        # Payment response
         if phone in waiting_for_payment:
             await handle_payment_response(phone, text)
             return {"status": "payment"}
-        await process_text_message(phone, contact, text)
-        return {"status": "text"}
+
+        # Buffer message and start/reset timer
+        await buffer_message(phone, contact, text)
+        return {"status": "buffered"}
 
     return {"status": "ignored"}
 
 
-# ── Prompts ────────────────────────────────────────────────────────────────────
+# ── Message buffer & timer ─────────────────────────────────────────────────────
 
-ORDER_PROMPT = """
-You are an assistant for an African food delivery business.
-Analyze the WhatsApp message and respond ONLY with valid JSON, no markdown.
+async def buffer_message(phone: str, contact: str, text: str):
+    """Add message to buffer and reset 5-minute timer."""
+    if phone not in client_buffers:
+        client_buffers[phone] = {"messages": [], "contact": contact, "timer_task": None}
 
-If it's an order:
-{
-  "type": "order",
-  "confidence": 0.9,
-  "notes": "",
-  "items": [
-    {
-      "product_name": "pounded yam",
-      "size": "5kg",
-      "bags": 1
-    }
-  ]
-}
+    client_buffers[phone]["messages"].append(text)
+    client_buffers[phone]["contact"] = contact
 
-If it's NOT an order (question, greeting, chat):
-{
-  "type": "question",
-  "message": "original text"
-}
+    # Cancel existing timer
+    existing = client_buffers[phone].get("timer_task")
+    if existing and not existing.done():
+        existing.cancel()
 
-Rules:
-- Extract product name WITHOUT size/weight (put size separately)
-- "5kg pounded yam" → product_name: "pounded yam", size: "5kg", bags: 1
-- "2 bags of rice 10kg" → product_name: "rice", size: "10kg", bags: 2
-- "some rice" → product_name: "rice", size: null, bags: 1
-- If confidence < 0.65, use type "question"
-- Never invent information
-"""
-
-CORRECTION_PROMPT = """
-You are an assistant that parses order corrections from a store operator.
-Respond ONLY with valid JSON, no markdown:
-
-{
-  "actions": [
-    {
-      "type": "add",
-      "product_name": "poundo yam eagle",
-      "size": "10kg",
-      "bags": 1
-    }
-  ]
-}
-
-Action types:
-- "replace": "X instead of Y", "remplacer X par Y", "X à la place de Y"
-  → { "type": "replace", "old_product": "Y", "new_product_name": "X", "size": "...", "bags": 1 }
-- "remove": "remove X", "enlever X", "supprimer X"
-  → { "type": "remove", "product_name": "X" }
-- "change_qty": "2 bags of X instead of 1", "changer quantité X à 2"
-  → { "type": "change_qty", "product_name": "X", "bags": 2 }
-- "add": anything else (adding missing product)
-  → { "type": "add", "product_name": "X", "size": "...", "bags": 1 }
-
-Always extract size separately from product name.
-"""
+    # Start new timer
+    task = asyncio.create_task(timer_expired(phone))
+    client_buffers[phone]["timer_task"] = task
+    log.info("Timer started for %s (%d messages)", phone, len(client_buffers[phone]["messages"]))
 
 
-def analyze_message(text: str) -> dict:
-    resp = anthropic_client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=1024,
-        system=ORDER_PROMPT,
-        messages=[{"role": "user", "content": text}],
-    )
-    raw = resp.content[0].text.strip().replace("```json", "").replace("```", "").strip()
-    log.info("Claude order: %s", raw)
-    return json.loads(raw)
+async def timer_expired(phone: str):
+    """Called after TIMER_SECONDS of silence — synthesize and notify admin."""
+    await asyncio.sleep(TIMER_SECONDS)
 
-
-def analyze_correction(text: str) -> dict:
-    resp = anthropic_client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=1024,
-        system=CORRECTION_PROMPT,
-        messages=[{"role": "user", "content": text}],
-    )
-    raw = resp.content[0].text.strip().replace("```json", "").replace("```", "").strip()
-    log.info("Claude correction: %s", raw)
-    return json.loads(raw)
-
-
-async def process_text_message(phone: str, contact: str, text: str):
-    try:
-        result = analyze_message(text)
-    except Exception as e:
-        log.error("Analysis error: %s", e)
-        await send_whatsapp(phone, "Sorry, an error occurred. Please try again.")
+    buffer = client_buffers.pop(phone, None)
+    if not buffer:
         return
 
-    if result.get("type") == "order" and result.get("confidence", 0) >= CONFIDENCE_THRESHOLD:
-        waiting_for_address[phone] = {"order_data": result, "contact": contact}
-        await send_whatsapp(phone,
-            "Thank you for your order! 🛒\n\n"
-            "Please provide your delivery address (including postal code):"
-        )
-    else:
+    messages = buffer["messages"]
+    contact  = buffer["contact"]
+
+    if not messages:
+        return
+
+    log.info("Timer expired for %s — synthesizing %d messages", phone, len(messages))
+    full_text = "\n".join(messages)
+
+    try:
+        result = analyze_message(full_text)
+    except Exception as e:
+        log.error("Synthesis error: %s", e)
         await send_whatsapp(ADMIN_PHONE,
-            f"💬 Message from {contact} ({phone}):\n\n{text}\n\n"
+            f"⚠️ Could not analyze message from {contact} ({phone}):\n\n{full_text}"
+        )
+        return
+
+    if result.get("type") != "order" or not result.get("items"):
+        # Not an order — forward to admin as regular message
+        await send_whatsapp(ADMIN_PHONE,
+            f"💬 Message from {contact} ({phone}):\n\n{full_text}\n\n"
             "Please reply to them directly on WhatsApp."
         )
-        await send_whatsapp(phone,
-            "Thank you for your message! Our team will get back to you shortly. 😊"
-        )
-
-
-# ── Address & shipping ─────────────────────────────────────────────────────────
-
-def is_idf(address: str) -> bool:
-    for pc in re.findall(r'\b(\d{5})\b', address):
-        if pc[:2] in IDF_PREFIXES:
-            return True
-    return False
-
-
-def calculate_shipping(address: str, total_amount: float, total_weight_kg: float) -> tuple:
-    if is_idf(address):
-        if total_amount >= IDF_FREE_DELIVERY_THRESHOLD:
-            return IDF_DELIVERY_FEE, f"IDF delivery fee: €{IDF_DELIVERY_FEE:.2f}"
-        else:
-            needed = IDF_FREE_DELIVERY_THRESHOLD - total_amount
-            shipping = GLS_BASE + GLS_PER_KG * total_weight_kg
-            return shipping, (
-                f"💡 Add €{needed:.2f} more for free IDF delivery (over €{IDF_FREE_DELIVERY_THRESHOLD:.0f})!\n"
-                f"Current delivery fee: €{shipping:.2f}"
-            )
-    else:
-        shipping = GLS_BASE + GLS_PER_KG * min(total_weight_kg, GLS_MAX_WEIGHT)
-        return shipping, f"GLS delivery: €{shipping:.2f} (€9 + €0.65/kg)"
-
-
-def get_price_ttc(models, uid, product_id: int, price_ht: float) -> float:
-    """Calculate TTC price by fetching tax rate from Odoo."""
-    try:
-        products = models.execute_kw(
-            ODOO_DB, uid, ODOO_PASSWORD, "product.template", "read",
-            [[product_id]], {"fields": ["taxes_id"]}
-        )
-        if not products:
-            return price_ht
-        tax_ids = products[0].get("taxes_id", [])
-        if not tax_ids:
-            return price_ht
-        taxes = models.execute_kw(
-            ODOO_DB, uid, ODOO_PASSWORD, "account.tax", "read",
-            [tax_ids], {"fields": ["amount", "amount_type"]}
-        )
-        total_tax_rate = 0.0
-        for tax in taxes:
-            if tax.get("amount_type") == "percent":
-                total_tax_rate += tax.get("amount", 0) / 100.0
-        return round(price_ht * (1 + total_tax_rate), 2)
-    except Exception as e:
-        log.warning("Could not get TTC price: %s", e)
-        return price_ht
-
-
-async def handle_address_response(phone: str, contact: str, address: str):
-    pending = waiting_for_address.pop(phone, None)
-    if not pending:
         return
-    order_data = pending["order_data"]
-    order_data["delivery_address"] = address
-    await resolve_items(phone, contact, address, order_data, [], [], [], 0.0, 0.0)
+
+    result["customer_phone"] = phone
+    result["customer_name"]  = contact
+
+    # Check if we know IDF status for this customer
+    idf_status = get_customer_idf(phone)
+    if idf_status is None:
+        # Ask admin
+        admin_waiting_idf["order_data"] = result
+        admin_waiting_idf["phone"] = phone
+        admin_waiting_idf["contact"] = contact
+
+        items_txt = format_items_preview(result)
+        await send_whatsapp(ADMIN_PHONE,
+            f"🛒 *New order detected*\n"
+            f"Customer: {contact} ({phone})\n\n"
+            f"{items_txt}\n\n"
+            f"Is this customer in *IDF*? Reply *YES* or *NO*"
+        )
+    else:
+        await process_order_with_idf(result, phone, contact, idf_status)
 
 
-def clarification_message(query: str, size: str, matches: list) -> str:
-    options = "\n".join(
-        f"  {i+1}. {m['name']} — €{m['price_ttc']:.2f}"
-        for i, m in enumerate(matches)
-    )
-    size_hint = f" ({size})" if size else ""
-    return (
-        f"Which *{query}{size_hint}* did you mean?\n\n"
-        f"{options}\n"
-        f"  0. None of the above — we'll get in touch to confirm\n\n"
-        f"Reply with the number or product name."
-    )
+# ── IDF handling ───────────────────────────────────────────────────────────────
+
+async def handle_admin_idf(txt: str):
+    """Admin answers YES/NO to IDF question."""
+    order_data = admin_waiting_idf.pop("order_data", None)
+    phone      = admin_waiting_idf.pop("phone", None)
+    contact    = admin_waiting_idf.pop("contact", None)
+
+    if not order_data:
+        return
+
+    txt_up = txt.strip().upper()
+    if txt_up in ("YES", "OUI", "Y"):
+        idf = True
+    elif txt_up in ("NO", "NON", "N"):
+        idf = False
+    else:
+        await send_whatsapp(ADMIN_PHONE, "Please reply *YES* or *NO*")
+        admin_waiting_idf["order_data"] = order_data
+        admin_waiting_idf["phone"] = phone
+        admin_waiting_idf["contact"] = contact
+        return
+
+    # Save IDF status on partner
+    save_customer_idf(phone, idf)
+    await process_order_with_idf(order_data, phone, contact, idf)
 
 
-async def resolve_items(phone, contact, address, order_data, resolved_items, unresolved, missing, total_amount, total_weight):
-    """Search Odoo for all items. Handle ambiguous and missing ones."""
+async def process_order_with_idf(order_data: dict, phone: str, contact: str, idf: bool):
+    """Resolve products and calculate shipping, then notify admin."""
     models, uid = odoo_login()
-    ambiguous = []
+    resolved = []
+    ambiguous_list = []
+    missing = []
+    total_amount = 0.0
+    total_weight = 0.0
 
     for item in order_data.get("items", []):
         product_name = item.get("product_name", "")
         size = item.get("size")
         bags = item.get("bags", 1)
-        # Always search by product name only, then filter by size
-        matches = find_products(models, uid, product_name)
-        # Enrich with TTC price before size filtering
-        for m in matches:
-            m["price_ttc"] = get_price_ttc(models, uid, m["id"], m["list_price"])
-        # If size specified, filter matches by size
-        if size and matches:
-            size_clean = size.lower().replace(" ", "")
-            size_filtered = [m for m in matches if size_clean in m["name"].lower()]
-            if size_filtered:
-                matches = size_filtered
 
-        # Enrich with TTC price
+        matches = find_products(models, uid, product_name, size)
         for m in matches:
             m["price_ttc"] = get_price_ttc(models, uid, m["id"], m["list_price"])
 
         if not matches:
-            # Not found — add to unresolved, process will continue
-            unresolved.append({
-                "product_name": f"{product_name} {size or ''}".strip(),
-                "quantity": bags,
-                "original_query": query,
-            })
+            missing.append(f"{product_name} {size or ''}".strip())
         elif len(matches) == 1:
-            # Check if size matches — if not, ask for clarification
             p = matches[0]
-            if size and size.lower().replace(" ", "") not in p["name"].lower():
-                # Size doesn't match — show as ambiguous so admin can confirm
-                ambiguous.append({
-                    "query": product_name, "size": size,
-                    "bags": bags, "matches": matches,
-                })
-            else:
-                price_ttc = p["price_ttc"]
-                line_total = price_ttc * bags
-                total_amount += line_total
-                total_weight += p.get("weight", 0) * bags
-                resolved_items.append({
-                    "product_id": p["id"],
-                    "product_name": p["name"],
-                    "quantity": bags,
-                    "unit_price": price_ttc,
-                    "line_total": line_total,
-                    "weight": p.get("weight", 0),
-                })
+            line_total = p["price_ttc"] * bags
+            total_amount += line_total
+            total_weight += p.get("weight", 0) * bags
+            resolved.append({
+                "product_id": p["id"], "product_name": p["name"],
+                "quantity": bags, "unit_price": p["price_ttc"],
+                "line_total": line_total, "weight": p.get("weight", 0),
+            })
         else:
-            # Multiple matches — if size specified, filter by size first
-            if size:
-                size_clean = size.lower().replace(" ", "")
-                size_matches = [m for m in matches if size_clean in m["name"].lower()]
-                if len(size_matches) == 1:
-                    p = size_matches[0]
-                    price_ttc = p["price_ttc"]
-                    line_total = price_ttc * bags
-                    total_amount += line_total
-                    total_weight += p.get("weight", 0) * bags
-                    resolved_items.append({
-                        "product_id": p["id"],
-                        "product_name": p["name"],
-                        "quantity": bags,
-                        "unit_price": price_ttc,
-                        "line_total": line_total,
-                        "weight": p.get("weight", 0),
-                    })
-                else:
-                    # Still ambiguous even with size filter
-                    ambiguous.append({
-                        "query": product_name, "size": size,
-                        "bags": bags, "matches": size_matches if size_matches else matches,
-                    })
-            else:
-                ambiguous.append({
-                    "query": product_name, "size": size,
-                    "bags": bags, "matches": matches,
-                })
+            ambiguous_list.append({
+                "query": product_name, "size": size,
+                "bags": bags, "matches": matches,
+            })
 
-    if ambiguous:
-        first = ambiguous[0]
-        await send_whatsapp(phone, clarification_message(
-            first["query"], first.get("size"), first["matches"]
-        ))
-        waiting_for_clarification[phone] = {
-            "order_data": order_data, "contact": contact, "address": address,
-            "ambiguous": ambiguous, "current_idx": 0,
-            "resolved_items": resolved_items, "unresolved": unresolved,
-            "missing": missing, "total_amount": total_amount, "total_weight": total_weight,
-        }
+    order_data["items_info"] = resolved
+    order_data["missing"] = missing
+    order_data["total_amount"] = total_amount
+    order_data["total_weight"] = total_weight
+    order_data["idf"] = idf
+
+    if ambiguous_list:
+        # Ask admin to clarify first ambiguous
+        admin_clarification["ambiguous"] = ambiguous_list
+        admin_clarification["current_idx"] = 0
+        admin_clarification["order_data"] = order_data
+        admin_clarification["phone"] = phone
+        admin_clarification["contact"] = contact
+
+        first = ambiguous_list[0]
+        await send_whatsapp(ADMIN_PHONE, clarification_msg(first))
     else:
-        # All done — notify admin
-        order_data["items_info"] = resolved_items
-        order_data["unresolved"] = unresolved
-        order_data["missing"] = missing
-        shipping_cost, shipping_note = calculate_shipping(address, total_amount, total_weight)
-        order_data["total_amount"] = total_amount
-        order_data["shipping_cost"] = shipping_cost
-        order_data["grand_total"] = total_amount + shipping_cost
-        order_data["total_weight"] = total_weight
-        await notify_admin(order_data, phone, contact, address, shipping_note)
+        await finalize_and_notify(order_data, phone, contact)
 
 
-# ── Clarification ──────────────────────────────────────────────────────────────
+async def finalize_and_notify(order_data: dict, phone: str, contact: str):
+    """Calculate shipping and send recap to admin."""
+    idf = order_data.get("idf", False)
+    total_amount = order_data.get("total_amount", 0)
+    total_weight = order_data.get("total_weight", 0)
+    shipping_cost, shipping_note = calculate_shipping(idf, total_amount, total_weight)
+    order_data["shipping_cost"] = shipping_cost
+    order_data["grand_total"] = total_amount + shipping_cost
 
-async def handle_clarification_response(phone: str, contact: str, text: str):
-    state = waiting_for_clarification.get(phone)
-    if not state:
-        return
-
-    ambiguous = state["ambiguous"]
-    idx = state["current_idx"]
-    current = ambiguous[idx]
-    matches = current["matches"]
-    bags = current["bags"]
-    t = text.strip()
-
-    # Customer chose "none of the above"
-    if t == "0":
-        state["unresolved"].append({
-            "product_name": f"{current['query']} {current.get('size') or ''}".strip(),
-            "quantity": bags,
-            "original_query": current["query"],
-        })
-        state["current_idx"] += 1
-        await _next_clarification_or_finish(phone, contact, state)
-        return
-
-    # Try to match choice
-    chosen = None
-    if t.isdigit():
-        n = int(t)
-        if 1 <= n <= len(matches):
-            chosen = matches[n - 1]
-    if not chosen:
-        t_lower = t.lower()
-        for m in matches:
-            if t_lower in m["name"].lower() or m["name"].lower() in t_lower:
-                chosen = m
-                break
-    if not chosen:
-        words = [w for w in t.lower().split() if len(w) > 2]
-        for m in matches:
-            if any(w in m["name"].lower() for w in words):
-                chosen = m
-                break
-
-    if not chosen:
-        await send_whatsapp(phone,
-            clarification_message(current["query"], current.get("size"), matches)
-        )
-        return
-
-    # Add chosen product
-    price_ttc = chosen.get("price_ttc", chosen["list_price"])
-    line_total = price_ttc * bags
-    state["resolved_items"].append({
-        "product_id": chosen["id"], "product_name": chosen["name"],
-        "quantity": bags, "unit_price": price_ttc,
-        "line_total": line_total, "weight": chosen.get("weight", 0),
-    })
-    state["total_amount"] += line_total
-    state["total_weight"] += chosen.get("weight", 0) * bags
-    state["current_idx"] += 1
-    await _next_clarification_or_finish(phone, contact, state)
-
-
-async def _next_clarification_or_finish(phone, contact, state):
-    ambiguous = state["ambiguous"]
-    if state["current_idx"] < len(ambiguous):
-        nxt = ambiguous[state["current_idx"]]
-        waiting_for_clarification[phone] = state
-        await send_whatsapp(phone, clarification_message(
-            nxt["query"], nxt.get("size"), nxt["matches"]
-        ))
-    else:
-        waiting_for_clarification.pop(phone, None)
-        order_data = state["order_data"]
-        address = state["address"]
-        total_amount = state["total_amount"]
-        total_weight = state["total_weight"]
-        order_data["items_info"] = state["resolved_items"]
-        order_data["unresolved"] = state["unresolved"]
-        order_data["missing"] = state["missing"]
-        shipping_cost, shipping_note = calculate_shipping(address, total_amount, total_weight)
-        order_data["total_amount"] = total_amount
-        order_data["shipping_cost"] = shipping_cost
-        order_data["grand_total"] = total_amount + shipping_cost
-        order_data["total_weight"] = total_weight
-        await notify_admin(order_data, phone, contact, address, shipping_note)
-
-
-# ── Admin notification ─────────────────────────────────────────────────────────
-
-async def notify_admin(order_data, phone, contact, address, shipping_note=""):
     token = str(uuid.uuid4())[:8]
     pending_orders[token] = {
-        "order_data": order_data, "phone": phone,
-        "contact": contact, "address": address
+        "order_data": order_data, "phone": phone, "contact": contact
     }
+
     items_info = order_data.get("items_info", [])
-    unresolved = order_data.get("unresolved", [])
+    missing = order_data.get("missing", [])
 
     lines = "\n".join(
         f"  • {it['product_name']} × {it['quantity']} — €{it['line_total']:.2f}"
         for it in items_info
     )
     msg = (
-        f"🛒 *New Order*\n"
-        f"Customer: {contact} ({phone})\n"
-        f"Address: {address}\n\n{lines}"
+        f"🛒 *New order — {contact} ({phone})*\n\n"
+        f"{lines}"
     )
-    if unresolved:
-        unresolved_txt = "\n".join(
-            f"  ❓ {u['product_name']} × {u['quantity']} — to confirm"
-            for u in unresolved
-        )
-        msg += f"\n\n⚠️ *Items to confirm:*\n{unresolved_txt}"
-
-    if shipping_note:
-        msg += f"\n\n🚚 {shipping_note}"
-
-    msg += f"\n\n💰 Subtotal: €{order_data.get('total_amount', 0):.2f}"
-    msg += f"\n🚚 Delivery: €{order_data.get('shipping_cost', 0):.2f}"
-    msg += f"\n💳 *Total: €{order_data.get('grand_total', 0):.2f}*"
+    if missing:
+        msg += f"\n\n⚠️ Not found: {', '.join(missing)}"
+    msg += f"\n\n🚚 {shipping_note}"
+    msg += f"\n💰 Subtotal: €{total_amount:.2f}"
+    msg += f"\n🚚 Delivery: €{shipping_cost:.2f}"
+    msg += f"\n💳 *Total: €{order_data['grand_total']:.2f}*"
     msg += "\n\nReply *OUI* to confirm, *NON* to cancel, or send a correction."
 
     await send_whatsapp(ADMIN_PHONE, msg)
-    await send_whatsapp(phone,
-        "Your order has been received! ✅\n"
-        "We are processing it and will confirm shortly."
+
+
+# ── Admin clarification (product ambiguity) ────────────────────────────────────
+
+def clarification_msg(amb: dict) -> str:
+    options = "\n".join(
+        f"  {i+1}. {m['name']} — €{m.get('price_ttc', m['list_price']):.2f}"
+        for i, m in enumerate(amb["matches"])
     )
+    size_hint = f" ({amb['size']})" if amb.get("size") else ""
+    return (
+        f"Which *{amb['query']}{size_hint}*?\n\n"
+        f"{options}\n"
+        f"  0. Not in catalogue — skip\n\n"
+        "Reply with number or name."
+    )
+
+
+async def handle_admin_clarification(txt: str):
+    ambiguous  = admin_clarification.get("ambiguous", [])
+    idx        = admin_clarification.get("current_idx", 0)
+    order_data = admin_clarification.get("order_data")
+    phone      = admin_clarification.get("phone")
+    contact    = admin_clarification.get("contact")
+
+    if not ambiguous or idx >= len(ambiguous):
+        return
+
+    current = ambiguous[idx]
+    matches = current["matches"]
+    bags    = current["bags"]
+    t       = txt.strip()
+
+    if t == "0":
+        # Skip this product
+        admin_clarification["current_idx"] += 1
+    else:
+        chosen = None
+        if t.isdigit():
+            n = int(t)
+            if 1 <= n <= len(matches):
+                chosen = matches[n - 1]
+        if not chosen:
+            t_lower = t.lower()
+            for m in matches:
+                if t_lower in m["name"].lower() or m["name"].lower() in t_lower:
+                    chosen = m
+                    break
+        if not chosen:
+            words = [w for w in t.lower().split() if len(w) > 2]
+            for m in matches:
+                if any(w in m["name"].lower() for w in words):
+                    chosen = m
+                    break
+
+        if not chosen:
+            await send_whatsapp(ADMIN_PHONE, clarification_msg(current))
+            return
+
+        price_ttc  = chosen.get("price_ttc", chosen["list_price"])
+        line_total = price_ttc * bags
+        order_data["items_info"].append({
+            "product_id": chosen["id"], "product_name": chosen["name"],
+            "quantity": bags, "unit_price": price_ttc,
+            "line_total": line_total, "weight": chosen.get("weight", 0),
+        })
+        order_data["total_amount"] += line_total
+        order_data["total_weight"] += chosen.get("weight", 0) * bags
+        admin_clarification["current_idx"] += 1
+
+    # Next ambiguous or finish
+    next_idx = admin_clarification["current_idx"]
+    if next_idx < len(ambiguous):
+        await send_whatsapp(ADMIN_PHONE, clarification_msg(ambiguous[next_idx]))
+    else:
+        admin_clarification.clear()
+        await finalize_and_notify(order_data, phone, contact)
 
 
 # ── Admin validation ───────────────────────────────────────────────────────────
@@ -554,24 +438,25 @@ async def handle_admin_validation(decision: str):
         await send_whatsapp(ADMIN_PHONE, "No pending orders.")
         return
 
-    token = next(iter(pending_orders))
+    token   = next(iter(pending_orders))
     pending = pending_orders.pop(token)
     order_data = pending["order_data"]
-    phone = pending["phone"]
-    contact = pending["contact"]
-    address = pending["address"]
+    phone      = pending["phone"]
+    contact    = pending["contact"]
 
     if decision == "OUI":
         try:
-            result = create_sale_order(order_data, phone, contact, address)
+            result = create_sale_order(order_data, phone, contact)
             if result is None:
                 await send_whatsapp(ADMIN_PHONE, "❌ No products found in Odoo.")
-                await send_whatsapp(phone, "Sorry, we could not process your order. We will contact you shortly.")
                 return
+
             order_name, _ = result
-            grand_total = order_data.get("grand_total", 0)
-            items_info = order_data.get("items_info", [])
+            grand_total   = order_data.get("grand_total", 0)
+            items_info    = order_data.get("items_info", [])
+
             await send_whatsapp(ADMIN_PHONE, f"✅ Order {order_name} created in Odoo.")
+
             items_txt = "\n".join(
                 f"  • {it['product_name']} × {it['quantity']} — €{it['line_total']:.2f}"
                 for it in items_info
@@ -584,7 +469,7 @@ async def handle_admin_validation(decision: str):
                 f"🚚 Delivery: €{order_data.get('shipping_cost', 0):.2f}\n"
                 f"💳 *Total: €{grand_total:.2f}*\n\n"
                 "How would you like to pay?\n"
-                "1️⃣ Card on delivery\n2️⃣ Cash on delivery\n3️⃣ Payment link (now)\n\n"
+                "1️⃣ Card on delivery\n2️⃣ Cash on delivery\n3️⃣ Payment link\n\n"
                 "Reply with 1, 2 or 3."
             )
         except Exception as e:
@@ -592,105 +477,183 @@ async def handle_admin_validation(decision: str):
             await send_whatsapp(ADMIN_PHONE, f"❌ Odoo error: {str(e)}")
     else:
         await send_whatsapp(ADMIN_PHONE, "Order cancelled.")
-        await send_whatsapp(phone, "Your order has been cancelled. Feel free to place a new order anytime! 😊")
+        await send_whatsapp(phone, "Sorry, we could not process your order. We will contact you shortly.")
 
 
 # ── Admin correction ───────────────────────────────────────────────────────────
+
+CORRECTION_PROMPT = """
+You are an assistant that parses order corrections from a store operator.
+Respond ONLY with valid JSON, no markdown:
+
+{
+  "actions": [
+    { "type": "add", "product_name": "poundo yam eagle", "size": "10kg", "bags": 1 },
+    { "type": "remove", "product_name": "olaola pounded yam" },
+    { "type": "replace", "old_product": "olaola pounded yam", "new_product_name": "poundo yam eagle", "size": "10kg", "bags": 1 },
+    { "type": "change_qty", "product_name": "merluza", "bags": 2 }
+  ]
+}
+
+- "instead of", "replace" → replace action
+- "remove", "enlever" → remove action
+- "add", "ajouter" → add action
+- quantity change → change_qty
+- no keyword → add
+"""
 
 async def handle_admin_correction(correction_text: str):
     if not pending_orders:
         return
 
-    token = next(iter(pending_orders))
+    token   = next(iter(pending_orders))
     pending = pending_orders.pop(token)
     order_data = pending["order_data"]
-    phone = pending["phone"]
-    contact = pending["contact"]
-    address = pending["address"]
+    phone      = pending["phone"]
+    contact    = pending["contact"]
 
     try:
         correction = analyze_correction(correction_text)
-        actions = correction.get("actions", [])
+        actions    = correction.get("actions", [])
     except Exception as e:
-        log.error("Correction parse error: %s", e)
-        await send_whatsapp(ADMIN_PHONE,
-            "Could not understand the correction. Please try again or reply OUI/NON."
-        )
+        log.error("Correction error: %s", e)
+        await send_whatsapp(ADMIN_PHONE, "Could not understand. Please try again or reply OUI/NON.")
         pending_orders[token] = pending
         return
 
-    models, uid = odoo_login()
-    items_info = list(order_data.get("items_info", []))
+    models, uid  = odoo_login()
+    items_info   = list(order_data.get("items_info", []))
 
     for action in actions:
-        action_type = action.get("type")
+        atype = action.get("type")
 
-        if action_type == "remove":
+        if atype == "remove":
             target = action.get("product_name", "").lower()
             items_info = [it for it in items_info if target not in it["product_name"].lower()]
 
-        elif action_type == "change_qty":
-            target = action.get("product_name", "").lower()
+        elif atype == "change_qty":
+            target  = action.get("product_name", "").lower()
             new_qty = action.get("bags", 1)
             for it in items_info:
                 if target in it["product_name"].lower():
-                    it["quantity"] = new_qty
+                    it["quantity"]   = new_qty
                     it["line_total"] = it["unit_price"] * new_qty
                     break
 
-        elif action_type in ("add", "replace"):
-            product_name = action.get("product_name") or action.get("new_product_name", "")
-            size = action.get("size")
-            bags = action.get("bags", 1)
-            query = f"{product_name} {size}" if size else product_name
-            matches = find_products(models, uid, query)
-            if not matches:
-                matches = find_products(models, uid, product_name)
+        elif atype in ("add", "replace"):
+            pname   = action.get("product_name") or action.get("new_product_name", "")
+            size    = action.get("size")
+            bags    = action.get("bags", 1)
+            matches = find_products(models, uid, pname, size)
 
             if matches:
-                p = matches[0]
-                price_ttc = get_price_ttc(models, uid, p["id"], p["list_price"])
-                new_item = {
+                p          = matches[0]
+                price_ttc  = get_price_ttc(models, uid, p["id"], p["list_price"])
+                new_item   = {
                     "product_id": p["id"], "product_name": p["name"],
                     "quantity": bags, "unit_price": price_ttc,
                     "line_total": price_ttc * bags, "weight": p.get("weight", 0),
                 }
-                if action_type == "replace":
-                    old_target = action.get("old_product", "").lower()
-                    if old_target:
-                        items_info = [it for it in items_info if old_target not in it["product_name"].lower()]
+                if atype == "replace":
+                    old = action.get("old_product", "").lower()
+                    if old:
+                        items_info = [it for it in items_info if old not in it["product_name"].lower()]
                 items_info.append(new_item)
             else:
-                await send_whatsapp(ADMIN_PHONE,
-                    f"⚠️ Product not found: *{product_name} {size or ''}*\nPlease try a different name."
-                )
+                await send_whatsapp(ADMIN_PHONE, f"⚠️ Product not found: *{pname} {size or ''}*")
                 pending_orders[token] = pending
                 return
 
-    # Recalculate totals
     total_amount = sum(it["line_total"] for it in items_info)
     total_weight = sum(it.get("weight", 0) * it["quantity"] for it in items_info)
-    shipping_cost, shipping_note = calculate_shipping(address, total_amount, total_weight)
+    idf          = order_data.get("idf", False)
+    shipping_cost, shipping_note = calculate_shipping(idf, total_amount, total_weight)
 
-    order_data["items_info"] = items_info
-    order_data["unresolved"] = []
+    order_data["items_info"]   = items_info
     order_data["total_amount"] = total_amount
     order_data["shipping_cost"] = shipping_cost
-    order_data["grand_total"] = total_amount + shipping_cost
+    order_data["grand_total"]  = total_amount + shipping_cost
     order_data["total_weight"] = total_weight
 
-    await notify_admin(order_data, phone, contact, address, shipping_note)
+    await finalize_and_notify(order_data, phone, contact)
+
+
+# ── CMD flow ───────────────────────────────────────────────────────────────────
+
+async def handle_cmd_start(txt: str):
+    order_text = txt[3:].strip().lstrip(":").strip()
+    if not order_text:
+        await send_whatsapp(ADMIN_PHONE,
+            "Type CMD followed by the order:\nExample: CMD 5kg president rice, merluza"
+        )
+        return
+    try:
+        result = analyze_message(order_text)
+    except Exception as e:
+        await send_whatsapp(ADMIN_PHONE, f"Could not parse: {str(e)}")
+        return
+
+    if not result.get("items"):
+        await send_whatsapp(ADMIN_PHONE, "No products found. Please try again.")
+        return
+
+    cmd_pending["order_data"] = result
+    cmd_pending["step"]       = "customer"
+    items_txt = format_items_preview(result)
+    await send_whatsapp(ADMIN_PHONE,
+        f"Order noted:\n{items_txt}\n\nWhich customer? Reply with their WhatsApp number."
+    )
+
+
+async def handle_cmd_customer(txt: str):
+    customer_phone = re.sub(r"[^\d]", "", txt)
+    if not customer_phone:
+        await send_whatsapp(ADMIN_PHONE, "Please provide a valid phone number. Example: 33768314654")
+        return
+
+    order_data = cmd_pending.get("order_data", {})
+    order_data["customer_phone"] = customer_phone
+    order_data["customer_name"]  = customer_phone
+
+    idf = get_customer_idf(customer_phone)
+    if idf is None:
+        cmd_pending["step"] = "idf"
+        await send_whatsapp(ADMIN_PHONE,
+            f"Customer: {customer_phone}\nIs this customer in *IDF*? Reply *YES* or *NO*"
+        )
+    else:
+        cmd_pending.clear()
+        await process_order_with_idf(order_data, customer_phone, customer_phone, idf)
+
+
+async def handle_cmd_idf(txt: str):
+    txt_up = txt.strip().upper()
+    order_data     = cmd_pending.pop("order_data", {})
+    customer_phone = order_data.get("customer_phone", "")
+
+    if txt_up in ("YES", "OUI", "Y"):
+        idf = True
+    elif txt_up in ("NO", "NON", "N"):
+        idf = False
+    else:
+        await send_whatsapp(ADMIN_PHONE, "Please reply *YES* or *NO*")
+        cmd_pending["order_data"] = order_data
+        return
+
+    cmd_pending.clear()
+    save_customer_idf(customer_phone, idf)
+    await process_order_with_idf(order_data, customer_phone, customer_phone, idf)
 
 
 # ── Payment ────────────────────────────────────────────────────────────────────
 
 async def handle_payment_response(phone: str, text: str):
-    pending = waiting_for_payment.pop(phone, None)
+    pending    = waiting_for_payment.pop(phone, None)
     if not pending:
         return
     order_name = pending["order_name"]
-    total = pending["total"]
-    choice = text.strip()
+    total      = pending["total"]
+    choice     = text.strip()
 
     if choice == "1":
         await send_whatsapp(phone, f"✅ *Card on delivery* for {order_name}.\nTotal: €{total:.2f}\n\nThank you! 🙏")
@@ -702,82 +665,187 @@ async def handle_payment_response(phone: str, text: str):
         await send_whatsapp(phone, f"✅ Payment link requested for {order_name} (€{total:.2f}).\nWe will send it shortly! ⏳")
         await send_whatsapp(ADMIN_PHONE, f"🔗 {order_name}: *Payment link* — €{total:.2f}\nPlease send the payment link.")
     else:
-        await send_whatsapp(phone, "Please reply with:\n1️⃣ Card on delivery\n2️⃣ Cash on delivery\n3️⃣ Payment link")
+        await send_whatsapp(phone, "Please reply:\n1️⃣ Card on delivery\n2️⃣ Cash on delivery\n3️⃣ Payment link")
         waiting_for_payment[phone] = pending
 
 
-# ── Catalog ────────────────────────────────────────────────────────────────────
+# ── Helpers ────────────────────────────────────────────────────────────────────
 
-async def process_catalog_order(phone: str, contact: str, order: dict):
-    items = [
-        {"product_name": p.get("product_retailer_id", ""), "size": None, "bags": p.get("quantity", 1)}
-        for p in order.get("product_items", [])
-    ]
-    order_data = {"type": "order", "confidence": 1.0, "customer_name": contact, "items": items}
-    waiting_for_address[phone] = {"order_data": order_data, "contact": contact}
-    await send_whatsapp(phone,
-        "Thank you for your order! 🛒\n\nPlease provide your delivery address (including postal code):"
+def format_items_preview(result: dict) -> str:
+    return "\n".join(
+        f"  • {it.get('product_name')} {it.get('size') or ''} × {it.get('bags', 1)}"
+        for it in result.get("items", [])
     )
+
+
+def calculate_shipping(idf: bool, total_amount: float, total_weight: float) -> tuple:
+    if idf:
+        if total_amount >= IDF_FREE_DELIVERY_THRESHOLD:
+            return IDF_DELIVERY_FEE, f"IDF delivery: €{IDF_DELIVERY_FEE:.2f}"
+        else:
+            needed   = IDF_FREE_DELIVERY_THRESHOLD - total_amount
+            shipping = GLS_BASE + GLS_PER_KG * total_weight
+            return shipping, (
+                f"💡 Add €{needed:.2f} more for free IDF delivery!\n"
+                f"Current delivery: €{shipping:.2f}"
+            )
+    else:
+        shipping = GLS_BASE + GLS_PER_KG * min(total_weight, GLS_MAX_WEIGHT)
+        return shipping, f"GLS delivery: €{shipping:.2f}"
+
+
+# ── Claude ─────────────────────────────────────────────────────────────────────
+
+ORDER_PROMPT = """
+You are an assistant for an African food delivery business.
+Analyze the message(s) and respond ONLY with valid JSON, no markdown.
+
+If it contains an order:
+{
+  "type": "order",
+  "confidence": 0.9,
+  "items": [
+    { "product_name": "pounded yam", "size": "5kg", "bags": 1 }
+  ]
+}
+
+If NOT an order:
+{ "type": "question", "message": "original text" }
+
+Rules:
+- Synthesize ALL messages together into one order
+- Extract product name WITHOUT size (put size separately)
+- "5kg pounded yam" → product_name: "pounded yam", size: "5kg", bags: 1
+- "2 bags rice 10kg" → product_name: "rice", size: "10kg", bags: 2
+- "some rice" → product_name: "rice", size: null, bags: 1
+- confidence < 0.65 → use type "question"
+"""
+
+def analyze_message(text: str) -> dict:
+    resp = anthropic_client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=1024,
+        system=ORDER_PROMPT,
+        messages=[{"role": "user", "content": text}],
+    )
+    raw = resp.content[0].text.strip().replace("```json", "").replace("```", "").strip()
+    log.info("Claude: %s", raw)
+    return json.loads(raw)
+
+
+def analyze_correction(text: str) -> dict:
+    resp = anthropic_client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=1024,
+        system=CORRECTION_PROMPT,
+        messages=[{"role": "user", "content": text}],
+    )
+    raw = resp.content[0].text.strip().replace("```json", "").replace("```", "").strip()
+    return json.loads(raw)
 
 
 # ── Odoo ───────────────────────────────────────────────────────────────────────
 
-def get_saved_address(phone: str) -> str | None:
-    """Look up saved delivery address for a customer by phone."""
-    try:
-        models, uid = odoo_login()
-        ids = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'res.partner', 'search',
-                                [[['phone', '=', phone]]])
-        if not ids:
-            return None
-        partner = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'res.partner', 'read',
-                                    [ids], {'fields': ['street']})[0]
-        return partner.get('street') or None
-    except Exception as e:
-        log.warning('Could not get saved address: %s', e)
-        return None
-
-
 def odoo_login():
     common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
-    uid = common.authenticate(ODOO_DB, ODOO_USER, ODOO_PASSWORD, {})
+    uid    = common.authenticate(ODOO_DB, ODOO_USER, ODOO_PASSWORD, {})
     if not uid:
         raise RuntimeError("Odoo auth failed")
     return xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object"), uid
 
 
-def find_products(models, uid, name: str) -> list:
+def find_products(models, uid, name: str, size: str = None) -> list:
     def search(domain):
         ids = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "product.template", "search",
                                 [domain], {"limit": 20})
         if not ids:
             return []
         return models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "product.template", "read",
-                                 [ids], {"fields": ["id", "name", "list_price", "weight", "taxes_id"]})
+                                 [ids], {"fields": ["id", "name", "list_price", "weight"]})
 
+    # Search by name only
     results = search([["name", "ilike", name], ["sale_ok", "=", True], ["is_published", "=", True]])
-    if results:
-        return results
 
-    words = [w for w in name.split() if len(w) > 2 and not re.match(r"^[0-9]+[kgKGlLmM]+$", w)]
-    if not words:
-        return []
+    # If no results, try word by word
+    if not results:
+        words = [w for w in name.split()
+                 if len(w) > 2 and not re.match(r"^[0-9]+[kgKGlLmM]+$", w)]
+        if words:
+            all_ids = None
+            for word in words:
+                ids = {p["id"] for p in search([["name", "ilike", word],
+                                                ["sale_ok", "=", True],
+                                                ["is_published", "=", True]])}
+                all_ids = ids if all_ids is None else all_ids & ids
+            if all_ids:
+                results = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
+                                            "product.template", "read",
+                                            [list(all_ids)],
+                                            {"fields": ["id", "name", "list_price", "weight"]})
 
-    all_ids = None
-    for word in words:
-        ids = {p["id"] for p in search([["name", "ilike", word], ["sale_ok", "=", True], ["is_published", "=", True]])}
-        all_ids = ids if all_ids is None else all_ids & ids
-    if all_ids:
-        return models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "product.template", "read",
-                                 [list(all_ids)], {"fields": ["id", "name", "list_price", "weight", "taxes_id"]})
+    # Filter by size if specified
+    if size and results:
+        size_clean    = size.lower().replace(" ", "")
+        size_filtered = [m for m in results if size_clean in m["name"].lower()]
+        if size_filtered:
+            return size_filtered
 
-    all_ids = set()
-    for word in words:
-        all_ids |= {p["id"] for p in search([["name", "ilike", word], ["sale_ok", "=", True], ["is_published", "=", True]])}
-    if all_ids:
-        return models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "product.template", "read",
-                                 [list(all_ids)[:5]], {"fields": ["id", "name", "list_price", "weight", "taxes_id"]})
-    return []
+    return results[:5]
+
+
+def get_price_ttc(models, uid, product_id: int, price_ht: float) -> float:
+    try:
+        products  = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
+                                      "product.template", "read",
+                                      [[product_id]], {"fields": ["taxes_id"]})[0]
+        tax_ids   = products.get("taxes_id", [])
+        if not tax_ids:
+            return price_ht
+        taxes     = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
+                                      "account.tax", "read",
+                                      [tax_ids], {"fields": ["amount", "amount_type"]})
+        tax_rate  = sum(t["amount"] / 100 for t in taxes if t.get("amount_type") == "percent")
+        return round(price_ht * (1 + tax_rate), 2)
+    except Exception:
+        return price_ht
+
+
+def get_customer_idf(phone: str):
+    """Returns True/False if known, None if unknown."""
+    try:
+        models, uid = odoo_login()
+        ids = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "res.partner", "search",
+                                [[["phone", "=", phone]]])
+        if not ids:
+            return None
+        partner = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "res.partner", "read",
+                                    [ids], {"fields": ["comment"]})[0]
+        comment = partner.get("comment") or ""
+        if "IDF:YES" in comment:
+            return True
+        if "IDF:NO" in comment:
+            return False
+        return None
+    except Exception:
+        return None
+
+
+def save_customer_idf(phone: str, idf: bool):
+    """Save IDF status in partner comment field."""
+    try:
+        models, uid = odoo_login()
+        ids = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "res.partner", "search",
+                                [[["phone", "=", phone]]])
+        idf_tag = "IDF:YES" if idf else "IDF:NO"
+        if ids:
+            models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "res.partner", "write",
+                              [ids, {"comment": idf_tag}])
+        else:
+            models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "res.partner", "create",
+                              [{"phone": phone, "name": phone,
+                                "customer_rank": 1, "comment": idf_tag}])
+    except Exception as e:
+        log.error("save_customer_idf error: %s", e)
 
 
 def find_or_create_customer(models, uid, name: str, phone: str) -> int:
@@ -789,14 +857,14 @@ def find_or_create_customer(models, uid, name: str, phone: str) -> int:
                              [{"name": name or phone, "phone": phone, "customer_rank": 1}])
 
 
-def create_sale_order(order_data: dict, phone: str, contact: str, address: str):
+def create_sale_order(order_data: dict, phone: str, contact: str):
     models, uid = odoo_login()
-    partner_id = find_or_create_customer(models, uid, order_data.get("customer_name") or contact, phone)
-    items_info = order_data.get("items_info", [])
+    partner_id  = find_or_create_customer(models, uid, contact, phone)
+    items_info  = order_data.get("items_info", [])
     if not items_info:
         return None
 
-    lines = []
+    lines   = []
     missing = []
     for item in items_info:
         product_ids = models.execute_kw(
@@ -819,22 +887,19 @@ def create_sale_order(order_data: dict, phone: str, contact: str, address: str):
     if shipping_cost > 0:
         delivery_ids = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD, "product.product", "search",
-            [[["name", "ilike", "Livraison"], ["sale_ok", "=", True], ["is_published", "=", True]]], {"limit": 1}
+            [[["name", "ilike", "Livraison"], ["sale_ok", "=", True]]], {"limit": 1}
         )
         if delivery_ids:
             lines.append((0, 0, {
                 "product_id": delivery_ids[0],
-                "product_uom_qty": 1, "price_unit": shipping_cost, "name": "Delivery fee",
+                "product_uom_qty": 1,
+                "price_unit": shipping_cost,
+                "name": "Delivery fee",
             }))
 
-    # Save delivery address on partner
-    if address:
-        models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "res.partner", "write",
-                          [[partner_id], {"street": address}])
-
     oid = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "sale.order", "create", [{
-        "partner_id": partner_id, "order_line": lines,
-        "note": f"Delivery: {address}" if address else "",
+        "partner_id": partner_id,
+        "order_line": lines,
         "client_order_ref": f"WA-{phone}",
     }])
     rec = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "sale.order", "read",
