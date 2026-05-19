@@ -1657,6 +1657,49 @@ async def invoice_push(request: Request):
         # Find partner (mapping first)
         partner_id = find_partner_by_name(models, uid, inv.get("fournisseur", ""))
 
+        # Detect if supplier is French → apply VAT
+        french_tax_id = False
+        if partner_id:
+            partner_info = models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD, "res.partner", "read",
+                [[partner_id]], {"fields": ["country_id"]}
+            )
+            country = partner_info[0].get("country_id")
+            is_french = country and country[1] in ("France", "FR")
+            if is_french:
+                # Find 5.5% food tax in Odoo
+                tax_ids_55 = models.execute_kw(
+                    ODOO_DB, uid, ODOO_PASSWORD, "account.tax", "search",
+                    [[["amount", "=", 5.5], ["type_tax_use", "=", "purchase"], ["active", "=", True]]],
+                    {"limit": 1}
+                )
+                if not tax_ids_55:
+                    # Try 20%
+                    tax_ids_55 = models.execute_kw(
+                        ODOO_DB, uid, ODOO_PASSWORD, "account.tax", "search",
+                        [[["amount", "=", 20.0], ["type_tax_use", "=", "purchase"], ["active", "=", True]]],
+                        {"limit": 1}
+                    )
+                french_tax_id = tax_ids_55[0] if tax_ids_55 else False
+                log.info("French supplier — tax id: %s", french_tax_id)
+            else:
+                log.info("Non-French supplier — no VAT applied")
+
+        def get_tax_ids_for_line(tva_pct):
+            """Get tax id matching the invoice line TVA percentage."""
+            if not french_tax_id:
+                return []
+            # Try to find exact match for the percentage on the invoice
+            if tva_pct and tva_pct > 0:
+                exact = models.execute_kw(
+                    ODOO_DB, uid, ODOO_PASSWORD, "account.tax", "search",
+                    [[["amount", "=", tva_pct], ["type_tax_use", "=", "purchase"], ["active", "=", True]]],
+                    {"limit": 1}
+                )
+                if exact:
+                    return [exact[0]]
+            return [french_tax_id]
+
         # Build invoice lines
         lines = []
         unmatched = []
@@ -1664,6 +1707,8 @@ async def invoice_push(request: Request):
             designation = l.get("designation", "")
             qty = l.get("quantite", 1)
             price = l.get("prix_unitaire_ht", 0)
+            tva_pct = l.get("tva_pct", 0)
+            tax_ids = get_tax_ids_for_line(tva_pct)
 
             # 1. Try mapping first
             mapped_id, facteur, note = find_product_in_mapping(designation)
@@ -1671,31 +1716,40 @@ async def invoice_push(request: Request):
                 real_qty = qty * facteur
                 prod = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "product.product", "read",
                     [[int(mapped_id)]], {"fields": ["id", "name"]})[0]
-                lines.append([0, 0, {
+                line_vals = {
                     "product_id": int(mapped_id),
                     "name": prod["name"],
                     "quantity": real_qty,
                     "price_unit": price / facteur if facteur > 1 else price,
-                }])
-                log.info("Mapped: %s -> %s qty=%s (x%s)", designation, prod["name"], real_qty, facteur)
+                }
+                if tax_ids:
+                    line_vals["tax_ids"] = [(6, 0, tax_ids)]
+                lines.append([0, 0, line_vals])
+                log.info("Mapped: %s -> %s qty=%s (x%s) tax=%s", designation, prod["name"], real_qty, facteur, tax_ids)
                 continue
 
             # 2. Fallback: Odoo search
             product_id, product = find_product_by_name(models, uid, designation)
             if product_id:
-                lines.append([0, 0, {
+                line_vals = {
                     "product_id": product_id,
                     "name": product["name"],
                     "quantity": qty,
                     "price_unit": price,
-                }])
+                }
+                if tax_ids:
+                    line_vals["tax_ids"] = [(6, 0, tax_ids)]
+                lines.append([0, 0, line_vals])
             else:
                 unmatched.append(designation)
-                lines.append([0, 0, {
+                line_vals = {
                     "name": f"[A LIER] {designation}",
                     "quantity": qty,
                     "price_unit": price,
-                }])
+                }
+                if tax_ids:
+                    line_vals["tax_ids"] = [(6, 0, tax_ids)]
+                lines.append([0, 0, line_vals])
 
         # Create vendor bill
         bill_id = models.execute_kw(
