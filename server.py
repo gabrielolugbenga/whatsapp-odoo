@@ -1714,13 +1714,18 @@ async def invoice_push(request: Request):
             mapped_id, facteur, note = find_product_in_mapping(designation)
             if mapped_id:
                 real_qty = qty * facteur
+                # Price per Odoo unit = price_per_invoice_unit / facteur
+                # e.g. facteur=0.2 (5KG unit): qty=30, price=3.75/kg
+                #   -> real_qty = 30*0.2 = 6 units of 5KG
+                #   -> price_unit = 3.75/0.2 = 18.75 per 5KG unit
+                real_price = price / facteur if facteur != 1 else price
                 prod = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "product.product", "read",
                     [[int(mapped_id)]], {"fields": ["id", "name"]})[0]
                 line_vals = {
                     "product_id": int(mapped_id),
                     "name": prod["name"],
                     "quantity": real_qty,
-                    "price_unit": price / facteur if facteur > 1 else price,
+                    "price_unit": real_price,
                 }
                 if tax_ids:
                     line_vals["tax_ids"] = [(6, 0, tax_ids)]
