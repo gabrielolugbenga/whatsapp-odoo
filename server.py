@@ -2142,53 +2142,63 @@ async def mapping_learn():
                 partner_name = partner[1]
                 partner_products[(partner_id, partner_name)][pid].append(line["quantity"])
 
-        # 5. Build summary for Claude
+        # 5. Build summary for Claude — process in batches to avoid token limits
         summary_lines = []
         for (partner_id, partner_name), products in partner_products.items():
             prod_list = []
-            for pid, qtys in products.items():
-                avg_qty = sum(qtys) / len(qtys)
-                prod_list.append(f"  - {product_map[pid]} (id:{pid}, qty moy:{avg_qty:.1f})")
-            summary_lines.append(f"Fournisseur: {partner_name} (id:{partner_id})\n" + "\n".join(prod_list))
+            for pid, qtys in list(products.items())[:30]:  # max 30 products per supplier
+                avg_qty = round(sum(qtys) / len(qtys), 1)
+                prod_list.append(f"{product_map[pid]} (id:{pid}, qty:{avg_qty})")
+            summary_lines.append(f"{partner_name} (id:{partner_id}): " + " | ".join(prod_list))
 
-        summary = "\n\n".join(summary_lines)
-        log.info("Built summary for %d suppliers", len(partner_products))
+        summary = "\n".join(summary_lines)
+        log.info("Built summary for %d suppliers, summary length: %d chars", len(partner_products), len(summary))
 
         # 6. Ask Claude to generate the mapping JSON
-        prompt = f"""Voici les fournisseurs et produits enregistrés dans Odoo à partir de factures réelles.
-Génère un mapping JSON pour reconnaître automatiquement les noms tels qu'ils apparaissent sur les factures fournisseurs.
+        prompt = f"""Tu es un assistant qui génère un fichier de mapping JSON.
 
-Données Odoo :
+Voici les fournisseurs et produits réels dans Odoo (extraits de factures validées) :
 {summary}
 
-Génère UNIQUEMENT un JSON valide avec ce format exact :
+Génère UNIQUEMENT un objet JSON valide, sans markdown, sans texte avant ou après.
+Format exact :
 {{
   "fournisseurs": {{
-    "NOM TEL QUE SUR FACTURE": <partner_id>,
-    "AUTRE NOM POSSIBLE": <partner_id>
+    "NOM FACTURE VARIANTE 1": <partner_id as integer>,
+    "NOM FACTURE VARIANTE 2": <partner_id as integer>
   }},
   "produits": {{
-    "MOT CLE SUR FACTURE": {{
-      "odoo_id": <product_id>,
-      "odoo_name": "nom dans Odoo",
+    "MOT CLE FACTURE": {{
+      "odoo_id": <product_id as integer>,
+      "odoo_name": "nom exact dans Odoo",
       "facteur": 1,
       "note": ""
     }}
   }}
 }}
 
-Règles :
-- Pour fournisseurs : mets plusieurs variantes du nom (avec/sans SAS/SARL/SRL, abréviations)
-- Pour produits : mets le mot-clé distinctif tel qu'il apparaîtrait sur une facture fournisseur (en majuscules)
-- facteur = 1 par défaut (à ajuster manuellement si conditionnement différent)
-- Inclus TOUS les produits et fournisseurs trouvés"""
+Règles strictes :
+- Les IDs doivent être des entiers, pas des strings
+- Pour chaque fournisseur, génère 2-3 variantes du nom (avec/sans SAS/SARL/SRL/INTERNATIONAL)
+- Pour chaque produit, le mot-clé doit être le mot distinctif en MAJUSCULES tel qu'il apparaît sur une facture
+- facteur = 1 par défaut
+- Retourne un JSON complet et valide"""
 
         resp = anthropic_client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=4000,
+            max_tokens=8000,
             messages=[{"role": "user", "content": prompt}]
         )
         raw = resp.content[0].text.strip().replace("```json", "").replace("```", "").strip()
+        # Ensure JSON is complete
+        if not raw.endswith("}"):
+            # Find last complete entry and close properly
+            last_brace = raw.rfind("}")
+            if last_brace > 0:
+                raw = raw[:last_brace+1]
+                # Count braces to close
+                opens = raw.count("{") - raw.count("}")
+                raw += "}" * opens
         suggested_mapping = json.loads(raw)
 
         # 7. Merge with existing mapping (don't overwrite manual entries)
