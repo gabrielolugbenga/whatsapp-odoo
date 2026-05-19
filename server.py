@@ -1592,69 +1592,58 @@ async def invoice_extract(file: UploadFile = File(...)):
 
 
 def find_partner_by_name(models, uid, supplier_name: str):
+    """Check mapping first, then fallback to Odoo search."""
     if not supplier_name:
         return False
-    # 1. Exact match
+    m = load_mapping()
+    # 1. Check mapping (exact key or substring match)
+    for key, pid in m.get("fournisseurs", {}).items():
+        if key.lower() in supplier_name.lower() or supplier_name.lower() in key.lower():
+            log.info("Partner from mapping: %s -> %s", supplier_name, pid)
+            return int(pid) if pid else False
+    # 2. Odoo exact
     ids = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "res.partner", "search",
         [[["name", "=ilike", supplier_name]]], {"limit": 1})
     if ids:
         return ids[0]
-    # 2. Full name ilike
+    # 3. Odoo ilike full name
     ids = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "res.partner", "search",
         [[["name", "ilike", supplier_name]]], {"limit": 1})
     if ids:
         return ids[0]
-    # 3. Significant words (skip legal suffixes)
-    skip = {"sas", "srl", "sarl", "eurl", "ltd", "gmbh", "inc", "bv"}
-    words = [w for w in supplier_name.split() if len(w) > 3 and w.lower() not in skip]
-    for word in words:
-        ids = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "res.partner", "search",
-            [[["name", "ilike", word]]], {"limit": 1})
-        if ids:
-            log.info("Partner word match on: %s", word)
-            return ids[0]
     log.info("Partner not found: %s", supplier_name)
     return False
+
+
+def find_product_in_mapping(designation: str):
+    """Return (odoo_id, facteur, note) from mapping if found."""
+    m = load_mapping()
+    desig_up = designation.upper()
+    for key, cfg in m.get("produits", {}).items():
+        if key.upper() in desig_up or desig_up in key.upper():
+            log.info("Product from mapping: %s -> id=%s x%s", designation, cfg.get("odoo_id"), cfg.get("facteur",1))
+            return cfg.get("odoo_id"), cfg.get("facteur", 1), cfg.get("note", "")
+    return None, 1, ""
 
 
 def find_product_by_name(models, uid, designation: str):
     if not designation:
         return None, None
-    # 1. Exact
+    # 1. Odoo exact
     ids = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "product.product", "search",
         [[["name", "=ilike", designation], ["active", "=", True]]], {"limit": 1})
     if ids:
         p = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "product.product", "read",
             [ids], {"fields": ["id", "name"]})[0]
         return ids[0], p
-    # 2. ilike full name
+    # 2. Odoo ilike
     ids = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "product.product", "search",
         [[["name", "ilike", designation], ["active", "=", True]]], {"limit": 1})
     if ids:
         p = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "product.product", "read",
             [ids], {"fields": ["id", "name"]})[0]
         return ids[0], p
-    # 3. Multi-word AND search
-    skip = {"the", "and", "pour", "de", "du", "la", "le", "les", "des"}
-    words = [w for w in designation.split() if len(w) > 3 and w.lower() not in skip]
-    if words:
-        domain = [["active", "=", True]] + [["name", "ilike", w] for w in words[:3]]
-        ids = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "product.product", "search",
-            [domain], {"limit": 1})
-        if ids:
-            p = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "product.product", "read",
-                [ids], {"fields": ["id", "name"]})[0]
-            log.info("Product multi-word match: %s", p["name"])
-            return ids[0], p
-        # 4. First significant word alone
-        ids = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "product.product", "search",
-            [[["name", "ilike", words[0]], ["active", "=", True]]], {"limit": 1})
-        if ids:
-            p = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "product.product", "read",
-                [ids], {"fields": ["id", "name"]})[0]
-            log.info("Product first-word match '%s': %s", words[0], p["name"])
-            return ids[0], p
-    log.info("Product not found: %s", designation)
+    log.info("Product not found in Odoo: %s", designation)
     return None, None
 
 
@@ -1665,16 +1654,33 @@ async def invoice_push(request: Request):
         log.info("Invoice push: %s / %s", inv.get("fournisseur"), inv.get("reference"))
         models, uid = odoo_login()
 
-        # Find partner
+        # Find partner (mapping first)
         partner_id = find_partner_by_name(models, uid, inv.get("fournisseur", ""))
 
-        # Build invoice lines with product matching
+        # Build invoice lines
         lines = []
         unmatched = []
         for l in inv.get("lignes", []):
             designation = l.get("designation", "")
             qty = l.get("quantite", 1)
             price = l.get("prix_unitaire_ht", 0)
+
+            # 1. Try mapping first
+            mapped_id, facteur, note = find_product_in_mapping(designation)
+            if mapped_id:
+                real_qty = qty * facteur
+                prod = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "product.product", "read",
+                    [[int(mapped_id)]], {"fields": ["id", "name"]})[0]
+                lines.append([0, 0, {
+                    "product_id": int(mapped_id),
+                    "name": prod["name"],
+                    "quantity": real_qty,
+                    "price_unit": price / facteur if facteur > 1 else price,
+                }])
+                log.info("Mapped: %s -> %s qty=%s (x%s)", designation, prod["name"], real_qty, facteur)
+                continue
+
+            # 2. Fallback: Odoo search
             product_id, product = find_product_by_name(models, uid, designation)
             if product_id:
                 lines.append([0, 0, {
@@ -1713,3 +1719,500 @@ async def invoice_push(request: Request):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
+# ── Mapping Tool ───────────────────────────────────────────────────────────────
+
+MAPPING_FILE = os.path.join(os.path.dirname(__file__), "mapping.json")
+
+def load_mapping() -> dict:
+    if os.path.exists(MAPPING_FILE):
+        with open(MAPPING_FILE) as f:
+            return json.load(f)
+    return {"fournisseurs": {}, "produits": {}}
+
+def save_mapping(data: dict):
+    with open(MAPPING_FILE, "w") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+MAPPING_HTML = r"""<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AfriComfort — Mapping</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=DM+Sans:wght@300;400;500;600&display=swap');
+:root{--bg:#0d0d0d;--sur:#161616;--sur2:#1f1f1f;--brd:#2a2a2a;--acc:#00e5a0;--acd:#00e5a015;--txt:#f0f0f0;--mut:#888;--dim:#555;--red:#ff4d4d;--orn:#f0a500;--mono:'IBM Plex Mono',monospace;--sans:'DM Sans',sans-serif}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--txt);font-family:var(--sans);font-size:14px;min-height:100vh;padding:32px}
+h1{font-size:22px;font-weight:300;margin-bottom:6px}.h1 span{color:var(--acc);font-weight:600}
+.sub{font-size:13px;color:var(--mut);margin-bottom:28px}
+.tabs{display:flex;gap:4px;margin-bottom:24px;border-bottom:1px solid var(--brd);padding-bottom:0}
+.tab{padding:10px 20px;font-size:13px;cursor:pointer;color:var(--mut);border-bottom:2px solid transparent;margin-bottom:-1px;transition:all .2s}
+.tab.active{color:var(--acc);border-bottom-color:var(--acc)}
+.section{display:none}.section.active{display:block}
+.card{background:var(--sur);border:1px solid var(--brd);border-radius:10px;overflow:hidden;margin-bottom:16px}
+.card-header{padding:12px 18px;background:var(--sur2);border-bottom:1px solid var(--brd);display:flex;align-items:center;justify-content:space-between}
+.card-title{font-size:13px;font-weight:500}
+.card-meta{font-size:11px;color:var(--mut);font-family:var(--mono)}
+table{width:100%;border-collapse:collapse}
+th{text-align:left;padding:10px 16px;font-size:10px;font-family:var(--mono);letter-spacing:.1em;text-transform:uppercase;color:var(--dim);border-bottom:1px solid var(--brd);background:var(--sur2)}
+td{padding:8px 16px;border-bottom:1px solid var(--brd);font-size:13px;vertical-align:middle}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:var(--sur2)}
+select,input[type=text],input[type=number]{background:var(--sur2);border:1px solid var(--brd);border-radius:5px;padding:5px 8px;color:var(--txt);font-size:12px;font-family:var(--mono);outline:none;transition:border-color .2s;width:100%}
+select:focus,input:focus{border-color:var(--acc)}
+.btn{padding:9px 20px;background:var(--acc);color:#000;border:none;border-radius:6px;font-family:var(--mono);font-size:12px;font-weight:500;cursor:pointer;transition:opacity .2s}
+.btn:hover{opacity:.85}
+.btn-sm{padding:5px 12px;background:transparent;border:1px solid var(--acc);color:var(--acc);border-radius:5px;font-family:var(--mono);font-size:11px;cursor:pointer}
+.btn-sm:hover{background:var(--acd)}
+.btn-del{padding:4px 10px;background:transparent;border:1px solid var(--red);color:var(--red);border-radius:5px;font-family:var(--mono);font-size:11px;cursor:pointer}
+.badge{display:inline-block;padding:2px 8px;border-radius:20px;font-size:10px;font-family:var(--mono);font-weight:500}
+.badge-ok{background:#00e5a020;color:var(--acc)}
+.badge-warn{background:#f0a50020;color:var(--orn)}
+.badge-err{background:#ff4d4d20;color:var(--red)}
+.log{background:var(--sur);border:1px solid var(--brd);border-radius:8px;padding:12px 16px;font-family:var(--mono);font-size:11px;color:var(--mut);max-height:80px;overflow-y:auto;margin-top:16px}
+.ll{display:flex;gap:8px}.lt{color:var(--dim);flex-shrink:0}
+.lok{color:var(--acc)}.lerr{color:var(--red)}.lwarn{color:var(--orn)}
+.actions{display:flex;gap:8px;margin-bottom:20px;align-items:center}
+.search{background:var(--sur2);border:1px solid var(--brd);border-radius:6px;padding:8px 12px;color:var(--txt);font-size:13px;outline:none;width:280px}
+.search:focus{border-color:var(--acc)}
+.hidden{display:none!important}
+.facteur-wrap{display:flex;gap:6px;align-items:center}
+.facteur-wrap input{width:60px}
+.facteur-wrap span{font-size:11px;color:var(--mut);white-space:nowrap}
+</style>
+</head>
+<body>
+<h1><span>AfriComfort</span> — Mapping fournisseurs & produits</h1>
+<div class="sub">Associe chaque nom de facture à un fournisseur/produit Odoo. Définis le conditionnement une fois pour toutes.</div>
+
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px">
+  <div class="tabs" style="margin-bottom:0;border-bottom:none">
+    <div class="tab active" onclick="showTab('suppliers')">Fournisseurs</div>
+    <div class="tab" onclick="showTab('products')">Produits & conditionnement</div>
+  </div>
+  <button class="btn" onclick="learnFromOdoo()" id="btn-learn">🧠 Apprendre depuis Odoo</button>
+</div>
+<div style="border-bottom:1px solid var(--brd);margin-bottom:24px"></div>
+
+<!-- SUPPLIERS -->
+<div class="section active" id="tab-suppliers">
+  <div class="actions">
+    <input class="search" id="s-search" placeholder="Filtrer fournisseurs..." oninput="filterTable('s-table',this.value)"/>
+    <button class="btn-sm" onclick="addSupplierRow()">+ Ajouter</button>
+    <button class="btn" onclick="saveAll()">↑ Sauvegarder tout</button>
+  </div>
+  <div class="card">
+    <div class="card-header">
+      <div class="card-title">Noms sur factures → Fournisseur Odoo</div>
+      <div class="card-meta" id="s-count"></div>
+    </div>
+    <table>
+      <thead><tr><th>Nom sur la facture</th><th>Fournisseur Odoo</th><th>Statut</th><th></th></tr></thead>
+      <tbody id="s-table"></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- PRODUCTS -->
+<div class="section" id="tab-products">
+  <div class="actions">
+    <input class="search" id="p-search" placeholder="Filtrer produits..." oninput="filterTable('p-table',this.value)"/>
+    <button class="btn-sm" onclick="addProductRow()">+ Ajouter</button>
+    <button class="btn" onclick="saveAll()">↑ Sauvegarder tout</button>
+  </div>
+  <div class="card">
+    <div class="card-header">
+      <div class="card-title">Noms sur factures → Produit Odoo + conditionnement</div>
+      <div class="card-meta" id="p-count"></div>
+    </div>
+    <table>
+      <thead><tr><th>Nom sur la facture</th><th>Produit Odoo</th><th>Conditionnement (×)</th><th>Note</th><th></th></tr></thead>
+      <tbody id="p-table"></tbody>
+    </table>
+  </div>
+</div>
+
+<div class="log" id="log"><div class="ll"><span class="lt">--:--:--</span><span>Chargement des données Odoo...</span></div></div>
+
+<script>
+let odooPartners = [];
+let odooProducts = [];
+let mapping = {fournisseurs:{}, produits:{}};
+
+const $=id=>document.getElementById(id);
+function log(m,t=''){const l=$('log'),n=document.createElement('div'),now=new Date().toLocaleTimeString('fr-FR');n.className='ll';n.innerHTML=`<span class="lt">${now}</span><span class="${t?'l'+t:''}">${m}</span>`;l.appendChild(n);l.scrollTop=l.scrollHeight}
+
+function showTab(t){
+  document.querySelectorAll('.tab').forEach((el,i)=>el.classList.toggle('active',['suppliers','products'][i]===t));
+  document.querySelectorAll('.section').forEach(el=>el.classList.remove('active'));
+  $(`tab-${t}`).classList.add('active');
+}
+
+function filterTable(tableId, q){
+  const rows = document.querySelectorAll(`#${tableId} tr`);
+  rows.forEach(r=>{r.style.display=r.textContent.toLowerCase().includes(q.toLowerCase())?'':'none'});
+}
+
+async function init(){
+  try{
+    const [pd, md] = await Promise.all([
+      fetch('/mapping/odoo-data').then(r=>r.json()),
+      fetch('/mapping/load').then(r=>r.json())
+    ]);
+    odooPartners = pd.partners || [];
+    odooProducts = pd.products || [];
+    mapping = md;
+    log(`Chargé : ${odooPartners.length} fournisseurs, ${odooProducts.length} produits Odoo`,'ok');
+    renderSuppliers();
+    renderProducts();
+  }catch(e){log(`Erreur chargement : ${e.message}`,'err')}
+}
+
+// ── SUPPLIERS ──────────────────────────────────────────────────────────────
+
+function partnerOptions(selectedId){
+  return `<option value="">— Sélectionner —</option>` +
+    odooPartners.map(p=>`<option value="${p.id}" ${p.id==selectedId?'selected':''}>${p.name}</option>`).join('');
+}
+
+function renderSuppliers(){
+  const tb = $('s-table'); tb.innerHTML='';
+  const entries = Object.entries(mapping.fournisseurs);
+  $('s-count').textContent = `${entries.length} entrée(s)`;
+  entries.forEach(([factureName, partnerId])=>{
+    const partner = odooPartners.find(p=>p.id==partnerId);
+    const tr = document.createElement('tr');
+    tr.dataset.key = factureName;
+    tr.innerHTML = `
+      <td><input type="text" value="${factureName}" onchange="renameSupplier(this,'${factureName}')" style="width:220px"/></td>
+      <td><select onchange="updateSupplier('${factureName}',this.value)">${partnerOptions(partnerId)}</select></td>
+      <td>${partner?`<span class="badge badge-ok">✓ ${partner.name}</span>`:`<span class="badge badge-err">Non trouvé (id:${partnerId})</span>`}</td>
+      <td><button class="btn-del" onclick="deleteSupplier('${factureName}')">✕</button></td>`;
+    tb.appendChild(tr);
+  });
+}
+
+function addSupplierRow(){
+  const key = prompt('Nom exact sur la facture (ex: SAS SULTAN EXOTIC):');
+  if(!key||!key.trim())return;
+  mapping.fournisseurs[key.trim()]='';
+  renderSuppliers();
+}
+
+function renameSupplier(input, oldKey){
+  const newKey = input.value.trim();
+  if(!newKey||newKey===oldKey)return;
+  const val = mapping.fournisseurs[oldKey];
+  delete mapping.fournisseurs[oldKey];
+  mapping.fournisseurs[newKey] = val;
+  renderSuppliers();
+}
+
+function updateSupplier(key, val){
+  mapping.fournisseurs[key] = val ? parseInt(val) : '';
+  renderSuppliers();
+}
+
+function deleteSupplier(key){
+  if(!confirm(`Supprimer "${key}" ?`))return;
+  delete mapping.fournisseurs[key];
+  renderSuppliers();
+}
+
+// ── PRODUCTS ───────────────────────────────────────────────────────────────
+
+function productOptions(selectedId){
+  return `<option value="">— Sélectionner —</option>` +
+    odooProducts.map(p=>`<option value="${p.id}" ${p.id==selectedId?'selected':''}>${p.name}</option>`).join('');
+}
+
+function renderProducts(){
+  const tb = $('p-table'); tb.innerHTML='';
+  const entries = Object.entries(mapping.produits);
+  $('p-count').textContent = `${entries.length} entrée(s)`;
+  entries.forEach(([factureName, cfg])=>{
+    const product = odooProducts.find(p=>p.id==cfg.odoo_id);
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td><input type="text" value="${factureName}" onchange="renameProduct(this,'${factureName}')" style="width:200px"/></td>
+      <td><select onchange="updateProduct('${factureName}','odoo_id',parseInt(this.value)||'')">${productOptions(cfg.odoo_id)}</select></td>
+      <td>
+        <div class="facteur-wrap">
+          <input type="number" min="1" value="${cfg.facteur||1}" onchange="updateProduct('${factureName}','facteur',parseFloat(this.value)||1)"/>
+          <span>× qté facture = qté Odoo</span>
+        </div>
+      </td>
+      <td><input type="text" value="${cfg.note||''}" placeholder="ex: 1 carton = 12 KG" onchange="updateProduct('${factureName}','note',this.value)" style="width:200px"/></td>
+      <td><button class="btn-del" onclick="deleteProduct('${factureName}')">✕</button></td>`;
+    tb.appendChild(tr);
+  });
+}
+
+function addProductRow(){
+  const key = prompt('Mot-clé sur la facture (ex: COW STOMACH):');
+  if(!key||!key.trim())return;
+  mapping.produits[key.trim()]={odoo_id:'',facteur:1,note:''};
+  renderProducts();
+}
+
+function renameProduct(input, oldKey){
+  const newKey = input.value.trim();
+  if(!newKey||newKey===oldKey)return;
+  const val = mapping.produits[oldKey];
+  delete mapping.produits[oldKey];
+  mapping.produits[newKey] = val;
+  renderProducts();
+}
+
+function updateProduct(key, field, val){
+  if(!mapping.produits[key]) mapping.produits[key]={odoo_id:'',facteur:1,note:''};
+  mapping.produits[key][field] = val;
+}
+
+function deleteProduct(key){
+  if(!confirm(`Supprimer "${key}" ?`))return;
+  delete mapping.produits[key];
+  renderProducts();
+}
+
+// ── SAVE ───────────────────────────────────────────────────────────────────
+
+async function saveAll(){
+  try{
+    const r = await fetch('/mapping/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(mapping)});
+    const d = await r.json();
+    if(d.error)throw new Error(d.error);
+    log(`Mapping sauvegardé — ${Object.keys(mapping.fournisseurs).length} fournisseurs, ${Object.keys(mapping.produits).length} produits`,'ok');
+  }catch(e){log(`Erreur sauvegarde : ${e.message}`,'err')}
+}
+
+async function learnFromOdoo(){
+  const btn = $('btn-learn');
+  btn.disabled=true;
+  btn.textContent='⏳ Analyse en cours...';
+  log('Lecture des factures Odoo — cela peut prendre 30 secondes...','warn');
+  try{
+    const r = await fetch('/mapping/learn');
+    const d = await r.json();
+    if(d.error)throw new Error(d.error);
+    log(`✓ ${d.bills_analyzed} factures analysées — ${d.suppliers_found} fournisseurs, ${d.mapping_products} produits mappés`,'ok');
+    log('Rechargement du mapping...','warn');
+    const md = await fetch('/mapping/load').then(r=>r.json());
+    mapping = md;
+    renderSuppliers();
+    renderProducts();
+    log('Mapping mis à jour — vérifie et ajuste les conditionnements','ok');
+  }catch(e){
+    log(`Erreur : ${e.message}`,'err');
+  }finally{
+    btn.disabled=false;
+    btn.textContent='🧠 Apprendre depuis Odoo';
+  }
+}
+
+init();
+</script>
+</body>
+</html>"""
+
+
+@app.get("/mapping", response_class=HTMLResponse)
+async def mapping_ui():
+    return HTMLResponse(content=MAPPING_HTML)
+
+
+@app.get("/mapping/odoo-data")
+async def mapping_odoo_data():
+    """Return all suppliers (is_company or supplier_rank>0) and products from Odoo."""
+    try:
+        models, uid = odoo_login()
+
+        # All partners with supplier rank > 0
+        partner_ids = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD, "res.partner", "search",
+            [[["supplier_rank", ">", 0]]], {"limit": 500}
+        )
+        partners = []
+        if partner_ids:
+            partners = models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD, "res.partner", "read",
+                [partner_ids], {"fields": ["id", "name"]}
+            )
+            partners = sorted(partners, key=lambda p: p["name"])
+
+        # All active products (purchasable)
+        product_ids = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD, "product.product", "search",
+            [[["active", "=", True], ["purchase_ok", "=", True]]], {"limit": 1000}
+        )
+        products = []
+        if product_ids:
+            products = models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD, "product.product", "read",
+                [product_ids], {"fields": ["id", "name"]}
+            )
+            products = sorted(products, key=lambda p: p["name"])
+
+        log.info("Mapping data: %d partners, %d products", len(partners), len(products))
+        return {"partners": partners, "products": products}
+
+    except Exception as e:
+        log.error("mapping_odoo_data error: %s", e)
+        return {"error": str(e), "partners": [], "products": []}
+
+
+@app.get("/mapping/load")
+async def mapping_load():
+    """Return current mapping file."""
+    return load_mapping()
+
+
+@app.post("/mapping/save")
+async def mapping_save(request: Request):
+    """Save mapping file."""
+    try:
+        data = await request.json()
+        save_mapping(data)
+        log.info("Mapping saved: %d suppliers, %d products",
+                  len(data.get("fournisseurs", {})), len(data.get("produits", {})))
+        return {"ok": True}
+    except Exception as e:
+        log.error("mapping_save error: %s", e)
+        return {"error": str(e)}
+
+@app.get("/mapping/learn")
+async def mapping_learn():
+    """
+    Read all validated vendor bills from Odoo and build a mapping
+    by analyzing supplier → product associations and quantities.
+    Then use Claude to suggest invoice name → Odoo product mappings.
+    """
+    try:
+        models, uid = odoo_login()
+        log.info("Learning from Odoo vendor bills...")
+
+        # 1. Fetch all validated vendor bills (last 500)
+        bill_ids = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD, "account.move", "search",
+            [[["move_type", "=", "in_invoice"], ["state", "=", "posted"]]], 
+            {"limit": 500, "order": "invoice_date desc"}
+        )
+        if not bill_ids:
+            return {"error": "Aucune facture validée trouvée dans Odoo"}
+
+        bills = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD, "account.move", "read",
+            [bill_ids], {"fields": ["id", "ref", "partner_id", "invoice_line_ids", "invoice_date"]}
+        )
+        log.info("Found %d validated bills", len(bills))
+
+        # 2. Collect all line IDs and fetch them
+        all_line_ids = []
+        for b in bills:
+            all_line_ids.extend(b.get("invoice_line_ids", []))
+
+        lines = []
+        if all_line_ids:
+            lines = models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD, "account.move.line", "read",
+                [all_line_ids],
+                {"fields": ["id", "move_id", "product_id", "name", "quantity", "price_unit"]}
+            )
+
+        # 3. Build bill_id → partner map
+        bill_partner = {b["id"]: b["partner_id"] for b in bills}
+
+        # 4. Aggregate: partner → products with avg qty
+        from collections import defaultdict
+        partner_products = defaultdict(lambda: defaultdict(list))
+        product_map = {}  # product_id -> name
+
+        for line in lines:
+            if not line.get("product_id"):
+                continue
+            pid = line["product_id"][0]
+            pname = line["product_id"][1]
+            product_map[pid] = pname
+            move_id = line["move_id"][0]
+            partner = bill_partner.get(move_id)
+            if partner:
+                partner_id = partner[0]
+                partner_name = partner[1]
+                partner_products[(partner_id, partner_name)][pid].append(line["quantity"])
+
+        # 5. Build summary for Claude
+        summary_lines = []
+        for (partner_id, partner_name), products in partner_products.items():
+            prod_list = []
+            for pid, qtys in products.items():
+                avg_qty = sum(qtys) / len(qtys)
+                prod_list.append(f"  - {product_map[pid]} (id:{pid}, qty moy:{avg_qty:.1f})")
+            summary_lines.append(f"Fournisseur: {partner_name} (id:{partner_id})\n" + "\n".join(prod_list))
+
+        summary = "\n\n".join(summary_lines)
+        log.info("Built summary for %d suppliers", len(partner_products))
+
+        # 6. Ask Claude to generate the mapping JSON
+        prompt = f"""Voici les fournisseurs et produits enregistrés dans Odoo à partir de factures réelles.
+Génère un mapping JSON pour reconnaître automatiquement les noms tels qu'ils apparaissent sur les factures fournisseurs.
+
+Données Odoo :
+{summary}
+
+Génère UNIQUEMENT un JSON valide avec ce format exact :
+{{
+  "fournisseurs": {{
+    "NOM TEL QUE SUR FACTURE": <partner_id>,
+    "AUTRE NOM POSSIBLE": <partner_id>
+  }},
+  "produits": {{
+    "MOT CLE SUR FACTURE": {{
+      "odoo_id": <product_id>,
+      "odoo_name": "nom dans Odoo",
+      "facteur": 1,
+      "note": ""
+    }}
+  }}
+}}
+
+Règles :
+- Pour fournisseurs : mets plusieurs variantes du nom (avec/sans SAS/SARL/SRL, abréviations)
+- Pour produits : mets le mot-clé distinctif tel qu'il apparaîtrait sur une facture fournisseur (en majuscules)
+- facteur = 1 par défaut (à ajuster manuellement si conditionnement différent)
+- Inclus TOUS les produits et fournisseurs trouvés"""
+
+        resp = anthropic_client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=4000,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        raw = resp.content[0].text.strip().replace("```json", "").replace("```", "").strip()
+        suggested_mapping = json.loads(raw)
+
+        # 7. Merge with existing mapping (don't overwrite manual entries)
+        existing = load_mapping()
+        for k, v in suggested_mapping.get("fournisseurs", {}).items():
+            if k not in existing["fournisseurs"]:
+                existing["fournisseurs"][k] = v
+        for k, v in suggested_mapping.get("produits", {}).items():
+            if k not in existing["produits"]:
+                existing["produits"][k] = v
+
+        save_mapping(existing)
+        log.info("Mapping learned: %d suppliers, %d products",
+                 len(existing["fournisseurs"]), len(existing["produits"]))
+
+        return {
+            "ok": True,
+            "bills_analyzed": len(bills),
+            "lines_analyzed": len(lines),
+            "suppliers_found": len(partner_products),
+            "mapping_suppliers": len(existing["fournisseurs"]),
+            "mapping_products": len(existing["produits"])
+        }
+
+    except Exception as e:
+        log.error("mapping_learn error: %s", e)
+        return {"error": str(e)}
