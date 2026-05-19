@@ -1591,37 +1591,105 @@ async def invoice_extract(file: UploadFile = File(...)):
         return {"error": str(e)}
 
 
+def find_partner_by_name(models, uid, supplier_name: str):
+    if not supplier_name:
+        return False
+    # 1. Exact match
+    ids = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "res.partner", "search",
+        [[["name", "=ilike", supplier_name]]], {"limit": 1})
+    if ids:
+        return ids[0]
+    # 2. Full name ilike
+    ids = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "res.partner", "search",
+        [[["name", "ilike", supplier_name]]], {"limit": 1})
+    if ids:
+        return ids[0]
+    # 3. Significant words (skip legal suffixes)
+    skip = {"sas", "srl", "sarl", "eurl", "ltd", "gmbh", "inc", "bv"}
+    words = [w for w in supplier_name.split() if len(w) > 3 and w.lower() not in skip]
+    for word in words:
+        ids = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "res.partner", "search",
+            [[["name", "ilike", word]]], {"limit": 1})
+        if ids:
+            log.info("Partner word match on: %s", word)
+            return ids[0]
+    log.info("Partner not found: %s", supplier_name)
+    return False
+
+
+def find_product_by_name(models, uid, designation: str):
+    if not designation:
+        return None, None
+    # 1. Exact
+    ids = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "product.product", "search",
+        [[["name", "=ilike", designation], ["active", "=", True]]], {"limit": 1})
+    if ids:
+        p = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "product.product", "read",
+            [ids], {"fields": ["id", "name"]})[0]
+        return ids[0], p
+    # 2. ilike full name
+    ids = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "product.product", "search",
+        [[["name", "ilike", designation], ["active", "=", True]]], {"limit": 1})
+    if ids:
+        p = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "product.product", "read",
+            [ids], {"fields": ["id", "name"]})[0]
+        return ids[0], p
+    # 3. Multi-word AND search
+    skip = {"the", "and", "pour", "de", "du", "la", "le", "les", "des"}
+    words = [w for w in designation.split() if len(w) > 3 and w.lower() not in skip]
+    if words:
+        domain = [["active", "=", True]] + [["name", "ilike", w] for w in words[:3]]
+        ids = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "product.product", "search",
+            [domain], {"limit": 1})
+        if ids:
+            p = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "product.product", "read",
+                [ids], {"fields": ["id", "name"]})[0]
+            log.info("Product multi-word match: %s", p["name"])
+            return ids[0], p
+        # 4. First significant word alone
+        ids = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "product.product", "search",
+            [[["name", "ilike", words[0]], ["active", "=", True]]], {"limit": 1})
+        if ids:
+            p = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "product.product", "read",
+                [ids], {"fields": ["id", "name"]})[0]
+            log.info("Product first-word match '%s': %s", words[0], p["name"])
+            return ids[0], p
+    log.info("Product not found: %s", designation)
+    return None, None
+
+
 @app.post("/invoice/push")
 async def invoice_push(request: Request):
     try:
         inv = await request.json()
         log.info("Invoice push: %s / %s", inv.get("fournisseur"), inv.get("reference"))
-
         models, uid = odoo_login()
 
         # Find partner
-        supplier_name = inv.get("fournisseur", "")
-        first_word = supplier_name.split()[0] if supplier_name else ""
-        partner_ids = models.execute_kw(
-            ODOO_DB, uid, ODOO_PASSWORD, "res.partner", "search",
-            [[["name", "ilike", first_word]]], {"limit": 5}
-        ) if first_word else []
+        partner_id = find_partner_by_name(models, uid, inv.get("fournisseur", ""))
 
-        partner_id = False
-        if partner_ids:
-            partners = models.execute_kw(
-                ODOO_DB, uid, ODOO_PASSWORD, "res.partner", "read",
-                [partner_ids], {"fields": ["id", "name"]}
-            )
-            partner_id = partners[0]["id"]
-            log.info("Partner: %s (id=%d)", partners[0]["name"], partner_id)
-
-        # Build invoice lines
-        lines = [[0, 0, {
-            "name": l.get("designation", ""),
-            "quantity": l.get("quantite", 1),
-            "price_unit": l.get("prix_unitaire_ht", 0),
-        }] for l in inv.get("lignes", [])]
+        # Build invoice lines with product matching
+        lines = []
+        unmatched = []
+        for l in inv.get("lignes", []):
+            designation = l.get("designation", "")
+            qty = l.get("quantite", 1)
+            price = l.get("prix_unitaire_ht", 0)
+            product_id, product = find_product_by_name(models, uid, designation)
+            if product_id:
+                lines.append([0, 0, {
+                    "product_id": product_id,
+                    "name": product["name"],
+                    "quantity": qty,
+                    "price_unit": price,
+                }])
+            else:
+                unmatched.append(designation)
+                lines.append([0, 0, {
+                    "name": f"[A LIER] {designation}",
+                    "quantity": qty,
+                    "price_unit": price,
+                }])
 
         # Create vendor bill
         bill_id = models.execute_kw(
@@ -1634,8 +1702,8 @@ async def invoice_push(request: Request):
                 "invoice_line_ids": lines,
             }]
         )
-        log.info("Bill created ID=%s with %d lines", bill_id, len(lines))
-        return {"bill_id": bill_id, "lines": len(lines)}
+        log.info("Bill ID=%s — %d lines, %d unmatched", bill_id, len(lines), len(unmatched))
+        return {"bill_id": bill_id, "lines": len(lines), "unmatched": unmatched, "partner_found": bool(partner_id)}
 
     except Exception as e:
         log.error("Invoice push error: %s", e)
