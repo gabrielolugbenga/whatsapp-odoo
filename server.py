@@ -2335,3 +2335,346 @@ Règles strictes :
     except Exception as e:
         log.error("mapping_learn error: %s", e)
         return {"error": str(e)}
+
+
+# ── Catalogue PDF ──────────────────────────────────────────────────────────────
+
+from fastapi.responses import StreamingResponse
+import io
+import base64
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.lib.units import mm
+from reportlab.platypus import (
+    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
+    Image as RLImage, PageBreak, KeepTogether
+)
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
+from reportlab.platypus import HRFlowable
+from collections import defaultdict
+
+BRAND_DARK  = colors.HexColor("#1A3C6E")
+BRAND_GREEN = colors.HexColor("#00A878")
+BRAND_LIGHT = colors.HexColor("#F0F7F4")
+BRAND_GRAY  = colors.HexColor("#F5F5F5")
+TEXT_DARK   = colors.HexColor("#222222")
+TEXT_MUTED  = colors.HexColor("#888888")
+
+CATEGORY_LABELS = {
+    "FAR": ("Farines & Féculents", "Flours & Starches"),
+    "VIPO": ("Viandes & Poissons", "Meat & Fish"),
+    "BOI": ("Boissons", "Beverages"),
+    "SEAS": ("Épices & Assaisonnements", "Spices & Seasonings"),
+    "GOU": ("Snacks & Gourmandises", "Snacks & Treats"),
+    "DEJ": ("Petit-Déjeuner", "Breakfast"),
+    "VEG": ("Légumes & Frais", "Vegetables & Fresh"),
+    "HUI": ("Huiles", "Oils"),
+    "COS": ("Cosmétiques", "Cosmetics"),
+    "RINOU": ("Riz & Nouilles", "Rice & Noodles"),
+    "AUTRE": ("Autres Produits", "Other Products"),
+}
+
+CAT_ORDER = ["RINOU", "FAR", "VIPO", "BOI", "SEAS", "GOU", "DEJ", "VEG", "HUI", "COS", "AUTRE"]
+
+
+def get_cat_prefix(ref):
+    if not ref:
+        return "AUTRE"
+    ref = ref.strip("[]")
+    for prefix in CAT_ORDER:
+        if ref.upper().startswith(prefix):
+            return prefix
+    return "AUTRE"
+
+
+def fetch_products_with_images(models, uid):
+    """Fetch all active products with images from Odoo."""
+    ids = models.execute_kw(
+        ODOO_DB, uid, ODOO_PASSWORD, "product.template", "search",
+        [[["active", "=", True], ["sale_ok", "=", True]]],
+        {"limit": 500}
+    )
+    if not ids:
+        return []
+    products = models.execute_kw(
+        ODOO_DB, uid, ODOO_PASSWORD, "product.template", "read",
+        [ids],
+        {"fields": ["id", "name", "default_code", "image_128", "categ_id"]}
+    )
+    return products
+
+
+def make_cover(styles):
+    """Generate cover page elements."""
+    elems = []
+    elems.append(Spacer(1, 40*mm))
+    elems.append(Paragraph(
+        '<font color="#1A3C6E"><b>AFRICOMFORT FOODS</b></font>',
+        ParagraphStyle("cover_title", fontSize=36, alignment=TA_CENTER,
+                       fontName="Helvetica-Bold", leading=44)
+    ))
+    elems.append(Spacer(1, 6*mm))
+    elems.append(Paragraph(
+        '<font color="#00A878">Catalogue Produits / Product Catalogue</font>',
+        ParagraphStyle("cover_sub", fontSize=18, alignment=TA_CENTER,
+                       fontName="Helvetica", leading=24)
+    ))
+    elems.append(Spacer(1, 4*mm))
+    elems.append(HRFlowable(width="60%", thickness=2, color=BRAND_GREEN,
+                             spaceAfter=6*mm, hAlign="CENTER"))
+    elems.append(Paragraph(
+        "Épicerie africaine & caribéenne / African & Caribbean Grocery",
+        ParagraphStyle("cover_desc", fontSize=12, alignment=TA_CENTER,
+                       fontName="Helvetica", textColor=TEXT_MUTED, leading=18)
+    ))
+    elems.append(Spacer(1, 8*mm))
+    elems.append(Paragraph(
+        "2026",
+        ParagraphStyle("cover_year", fontSize=14, alignment=TA_CENTER,
+                       fontName="Helvetica", textColor=TEXT_MUTED)
+    ))
+    elems.append(Spacer(1, 40*mm))
+
+    # Contact block
+    contact_data = [
+        ["AfriComfort Foods International"],
+        ["www.africomfortfoods.com"],
+        ["africomfortfoods@gmail.com"],
+        ["Paris, France"],
+    ]
+    contact_table = Table(contact_data, colWidths=[120*mm])
+    contact_table.setStyle(TableStyle([
+        ("ALIGN", (0,0), (-1,-1), "CENTER"),
+        ("FONTNAME", (0,0), (0,0), "Helvetica-Bold"),
+        ("FONTSIZE", (0,0), (0,0), 13),
+        ("FONTSIZE", (0,1), (-1,-1), 11),
+        ("TEXTCOLOR", (0,0), (0,0), BRAND_DARK),
+        ("TEXTCOLOR", (0,1), (-1,-1), TEXT_MUTED),
+        ("TOPPADDING", (0,0), (-1,-1), 3),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 3),
+    ]))
+    elems.append(contact_table)
+    elems.append(PageBreak())
+    return elems
+
+
+def make_conditions(styles):
+    """Generate commercial conditions page."""
+    elems = []
+    elems.append(Paragraph(
+        "Conditions Commerciales / Commercial Terms",
+        ParagraphStyle("sec_title", fontSize=18, fontName="Helvetica-Bold",
+                       textColor=BRAND_DARK, spaceAfter=6*mm)
+    ))
+    elems.append(HRFlowable(width="100%", thickness=1.5, color=BRAND_GREEN,
+                             spaceAfter=8*mm))
+
+    terms = [
+        ("🕐  Délais de livraison / Delivery", 
+         "Paris & Île-de-France : 24-48h\nFrance : 48-72h\nSur devis pour commandes Europe / Europe on request"),
+        ("📦  Commande minimum / Minimum order",
+         "Commande minimum : 150€ HT\nMinimum order: €150 excl. VAT"),
+        ("💶  Paiement / Payment",
+         "Nouveaux clients : paiement à la commande\nClients établis : conditions sur accord commercial\nNew clients: payment on order\nEstablished clients: terms by agreement"),
+        ("🔄  Retours / Returns",
+         "Produits non conformes uniquement, sous 48h après livraison\nNon-conforming products only, within 48h of delivery"),
+        ("📋  Tarifs / Pricing",
+         "Tarifs sur demande — contact commercial\nPrices on request — contact our sales team\nafriacomfortfoods@gmail.com"),
+    ]
+
+    for title, body in terms:
+        elems.append(Paragraph(
+            f"<b>{title}</b>",
+            ParagraphStyle("term_title", fontSize=12, fontName="Helvetica-Bold",
+                           textColor=BRAND_DARK, spaceBefore=6*mm, spaceAfter=2*mm)
+        ))
+        elems.append(Paragraph(
+            body.replace("\n", "<br/>"),
+            ParagraphStyle("term_body", fontSize=10, fontName="Helvetica",
+                           textColor=TEXT_DARK, leading=16, leftIndent=10)
+        ))
+
+    elems.append(PageBreak())
+    return elems
+
+
+def build_catalogue_pdf(products):
+    """Build the full catalogue PDF and return bytes."""
+    buf = io.BytesIO()
+    PAGE_W, PAGE_H = A4
+
+    def header_footer(canvas, doc):
+        canvas.saveState()
+        # Header bar
+        canvas.setFillColor(BRAND_DARK)
+        canvas.rect(0, PAGE_H - 18*mm, PAGE_W, 18*mm, fill=1, stroke=0)
+        canvas.setFillColor(colors.white)
+        canvas.setFont("Helvetica-Bold", 10)
+        canvas.drawString(15*mm, PAGE_H - 11*mm, "AFRICOMFORT FOODS")
+        canvas.setFont("Helvetica", 9)
+        canvas.drawRightString(PAGE_W - 15*mm, PAGE_H - 11*mm,
+                               "Catalogue 2026 — Épicerie africaine & caribéenne")
+        # Green accent line
+        canvas.setFillColor(BRAND_GREEN)
+        canvas.rect(0, PAGE_H - 19.5*mm, PAGE_W, 1.5*mm, fill=1, stroke=0)
+
+        # Footer
+        canvas.setFillColor(BRAND_LIGHT)
+        canvas.rect(0, 0, PAGE_W, 10*mm, fill=1, stroke=0)
+        canvas.setFillColor(TEXT_MUTED)
+        canvas.setFont("Helvetica", 8)
+        canvas.drawString(15*mm, 3.5*mm, "www.africomfortfoods.com — africomfortfoods@gmail.com")
+        canvas.drawRightString(PAGE_W - 15*mm, 3.5*mm, f"Page {doc.page}")
+        canvas.restoreState()
+
+    doc = SimpleDocTemplate(
+        buf, pagesize=A4,
+        leftMargin=12*mm, rightMargin=12*mm,
+        topMargin=24*mm, bottomMargin=16*mm
+    )
+    styles = getSampleStyleSheet()
+    story = []
+
+    # Cover
+    story += make_cover(styles)
+
+    # Conditions
+    story += make_conditions(styles)
+
+    # Group by category
+    by_cat = defaultdict(list)
+    for p in products:
+        prefix = get_cat_prefix(p.get("default_code", ""))
+        by_cat[prefix].append(p)
+
+    cat_style = ParagraphStyle(
+        "cat_header", fontSize=16, fontName="Helvetica-Bold",
+        textColor=colors.white, alignment=TA_LEFT, leading=20
+    )
+    ref_style = ParagraphStyle(
+        "ref", fontSize=7.5, fontName="Helvetica",
+        textColor=TEXT_MUTED, leading=10
+    )
+    name_style = ParagraphStyle(
+        "name", fontSize=9.5, fontName="Helvetica-Bold",
+        textColor=TEXT_DARK, leading=13
+    )
+    name_en_style = ParagraphStyle(
+        "name_en", fontSize=8.5, fontName="Helvetica",
+        textColor=TEXT_MUTED, leading=12
+    )
+
+    IMG_SIZE = 28*mm
+    COL_W = [IMG_SIZE + 2*mm, 0]  # will be computed below
+    COLS = 4
+    CELL_W = (PAGE_W - 24*mm) / COLS
+
+    for prefix in CAT_ORDER:
+        prods = by_cat.get(prefix, [])
+        if not prods:
+            continue
+
+        labels = CATEGORY_LABELS.get(prefix, (prefix, prefix))
+        fr_label, en_label = labels
+
+        # Category header
+        cat_table = Table(
+            [[Paragraph(f"{fr_label}  /  {en_label}", cat_style)]],
+            colWidths=[PAGE_W - 24*mm]
+        )
+        cat_table.setStyle(TableStyle([
+            ("BACKGROUND", (0,0), (-1,-1), BRAND_DARK),
+            ("TOPPADDING", (0,0), (-1,-1), 8),
+            ("BOTTOMPADDING", (0,0), (-1,-1), 8),
+            ("LEFTPADDING", (0,0), (-1,-1), 10),
+            ("RIGHTPADDING", (0,0), (-1,-1), 10),
+        ]))
+        story.append(Spacer(1, 4*mm))
+        story.append(cat_table)
+        story.append(Spacer(1, 4*mm))
+
+        # Products grid — 4 per row
+        prods_sorted = sorted(prods, key=lambda x: x.get("default_code") or x.get("name", ""))
+        row_data = []
+        current_row = []
+
+        for prod in prods_sorted:
+            ref = prod.get("default_code", "")
+            name = prod.get("name", "")
+            img_b64 = prod.get("image_128", "")
+
+            # Build image
+            if img_b64:
+                try:
+                    img_bytes = base64.b64decode(img_b64)
+                    img_buf = io.BytesIO(img_bytes)
+                    img = RLImage(img_buf, width=IMG_SIZE, height=IMG_SIZE)
+                except Exception:
+                    img = Paragraph("", name_style)
+            else:
+                img = Paragraph("", name_style)
+
+            cell = Table(
+                [[img], [Paragraph(ref, ref_style)], [Paragraph(name, name_style)]],
+                colWidths=[CELL_W - 4*mm]
+            )
+            cell.setStyle(TableStyle([
+                ("ALIGN", (0,0), (-1,-1), "CENTER"),
+                ("VALIGN", (0,0), (-1,-1), "TOP"),
+                ("TOPPADDING", (0,0), (-1,-1), 3),
+                ("BOTTOMPADDING", (0,0), (-1,-1), 3),
+                ("LEFTPADDING", (0,0), (-1,-1), 2),
+                ("RIGHTPADDING", (0,0), (-1,-1), 2),
+                ("BACKGROUND", (0,0), (-1,-1), colors.white),
+                ("BOX", (0,0), (-1,-1), 0.5, colors.HexColor("#EEEEEE")),
+                ("ROUNDEDCORNERS", [4]),
+            ]))
+            current_row.append(cell)
+
+            if len(current_row) == COLS:
+                row_data.append(current_row)
+                current_row = []
+
+        # Pad last row
+        while len(current_row) > 0 and len(current_row) < COLS:
+            current_row.append(Paragraph("", name_style))
+        if current_row:
+            row_data.append(current_row)
+
+        if row_data:
+            grid = Table(row_data, colWidths=[CELL_W] * COLS,
+                         repeatRows=0)
+            grid.setStyle(TableStyle([
+                ("VALIGN", (0,0), (-1,-1), "TOP"),
+                ("TOPPADDING", (0,0), (-1,-1), 3),
+                ("BOTTOMPADDING", (0,0), (-1,-1), 3),
+                ("LEFTPADDING", (0,0), (-1,-1), 2),
+                ("RIGHTPADDING", (0,0), (-1,-1), 2),
+            ]))
+            story.append(grid)
+            story.append(Spacer(1, 4*mm))
+
+    doc.build(story, onFirstPage=header_footer, onLaterPages=header_footer)
+    buf.seek(0)
+    return buf.read()
+
+
+@app.get("/catalogue/pdf")
+async def catalogue_pdf():
+    """Generate and return the product catalogue as PDF."""
+    try:
+        models, uid = odoo_login()
+        log.info("Fetching products for catalogue...")
+        products = fetch_products_with_images(models, uid)
+        log.info("Generating PDF for %d products...", len(products))
+        pdf_bytes = build_catalogue_pdf(products)
+        log.info("Catalogue PDF generated: %d bytes", len(pdf_bytes))
+        return StreamingResponse(
+            io.BytesIO(pdf_bytes),
+            media_type="application/pdf",
+            headers={"Content-Disposition": "attachment; filename=AfriComfort_Catalogue_2026.pdf"}
+        )
+    except Exception as e:
+        log.error("catalogue_pdf error: %s", e)
+        return {"error": str(e)}
