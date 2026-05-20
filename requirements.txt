@@ -4,3 +4,4 @@ httpx
 anthropic
 python-dotenv
 python-multipart
+reportlab
