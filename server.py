@@ -2388,8 +2388,18 @@ def get_cat_prefix(ref):
     return "AUTRE"
 
 
+# Products to exclude from catalogue
+CATALOGUE_EXCLUDED = [
+    "beans powder",
+    "smoked catfish",
+    "smocked catfish",
+    "dried snail",
+    "jekomo",
+    "orijin",
+]
+
 def fetch_products_with_images(models, uid):
-    """Fetch all active products with images from Odoo."""
+    """Fetch all active products with images from Odoo, excluding no-photo and blacklisted."""
     ids = models.execute_kw(
         ODOO_DB, uid, ODOO_PASSWORD, "product.template", "search",
         [[["active", "=", True], ["sale_ok", "=", True]]],
@@ -2402,7 +2412,25 @@ def fetch_products_with_images(models, uid):
         [ids],
         {"fields": ["id", "name", "default_code", "image_128", "categ_id"]}
     )
-    return products
+    filtered = []
+    for p in products:
+        # Exclude products without photo
+        img = p.get("image_128")
+        if not img or not isinstance(img, str) or len(img) < 100:
+            log.info("Catalogue: excluded (no photo) — %s", p.get("name"))
+            continue
+        # Exclude blacklisted products
+        name_lower = (p.get("name") or "").lower()
+        excluded = False
+        for excl in CATALOGUE_EXCLUDED:
+            if excl in name_lower:
+                log.info("Catalogue: excluded (blacklist) — %s", p.get("name"))
+                excluded = True
+                break
+        if not excluded:
+            filtered.append(p)
+    log.info("Catalogue: %d products after filtering (from %d)", len(filtered), len(products))
+    return filtered
 
 
 def make_cover(styles):
@@ -2474,7 +2502,7 @@ def make_conditions(styles):
         ("🕐  Délais de livraison / Delivery", 
          "Paris & Île-de-France : 24-48h\nFrance : 48-72h\nSur devis pour commandes Europe / Europe on request"),
         ("📦  Commande minimum / Minimum order",
-         "Commande minimum : 150€ HT\nMinimum order: €150 excl. VAT"),
+         "Commande minimum : 2 000€ HT\nMinimum order: €2,000 excl. VAT"),
         ("💶  Paiement / Payment",
          "Nouveaux clients : paiement à la commande\nClients établis : conditions sur accord commercial\nNew clients: payment on order\nEstablished clients: terms by agreement"),
         ("🔄  Retours / Returns",
@@ -2571,6 +2599,8 @@ def build_catalogue_pdf(products):
     CELL_W = (PAGE_W - 24*mm) / COLS
 
     for prefix in CAT_ORDER:
+        if prefix == "AUTRE":
+            continue  # Never show "Autres Produits" in catalogue
         prods = by_cat.get(prefix, [])
         if not prods:
             continue
