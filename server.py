@@ -2595,14 +2595,17 @@ def build_catalogue_pdf(products):
         story.append(Spacer(1, 4*mm))
 
         # Products grid — 4 per row
-        prods_sorted = sorted(prods, key=lambda x: x.get("default_code") or x.get("name", ""))
+        prods_sorted = sorted(prods, key=lambda x: (x.get("default_code") or x.get("name") or ""))
         row_data = []
         current_row = []
 
         for prod in prods_sorted:
-            ref = prod.get("default_code", "")
-            name = prod.get("name", "")
-            img_b64 = prod.get("image_128", "")
+            ref = prod.get("default_code") or ""
+            name = prod.get("name") or ""
+            img_b64 = prod.get("image_128") or ""
+            if not isinstance(ref, str): ref = ""
+            if not isinstance(name, str): name = ""
+            if not isinstance(img_b64, str): img_b64 = ""
 
             # Build image
             if img_b64:
