@@ -1782,16 +1782,77 @@ if __name__ == "__main__":
 # ── Mapping Tool ───────────────────────────────────────────────────────────────
 
 MAPPING_FILE = os.path.join(os.path.dirname(__file__), "mapping.json")
+MAPPING_ENV_KEY = "AFRICOMFORT_MAPPING"
 
 def load_mapping() -> dict:
+    # 1. Try environment variable first (persistent across deploys)
+    env_val = os.environ.get(MAPPING_ENV_KEY)
+    if env_val:
+        try:
+            return json.loads(env_val)
+        except Exception:
+            pass
+    # 2. Fallback to local file (dev only)
     if os.path.exists(MAPPING_FILE):
         with open(MAPPING_FILE) as f:
             return json.load(f)
     return {"fournisseurs": {}, "produits": {}}
 
 def save_mapping(data: dict):
+    # Save to local file
     with open(MAPPING_FILE, "w") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+    # Also save to Odoo as a system parameter (persistent storage)
+    try:
+        models, uid = odoo_login()
+        json_str = json.dumps(data, ensure_ascii=False)
+        # Check if param exists
+        existing = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD, "ir.config_parameter", "search",
+            [[["key", "=", "africomfort.invoice.mapping"]]], {"limit": 1}
+        )
+        if existing:
+            models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD, "ir.config_parameter", "write",
+                [existing, {"value": json_str}]
+            )
+        else:
+            models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD, "ir.config_parameter", "create",
+                [{"key": "africomfort.invoice.mapping", "value": json_str}]
+            )
+        log.info("Mapping saved to Odoo system parameters")
+    except Exception as e:
+        log.warning("Could not save mapping to Odoo: %s", e)
+
+def load_mapping() -> dict:
+    # 1. Try Odoo system parameters (most persistent)
+    try:
+        models, uid = odoo_login()
+        params = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD, "ir.config_parameter", "search_read",
+            [[["key", "=", "africomfort.invoice.mapping"]]],
+            {"fields": ["value"], "limit": 1}
+        )
+        if params and params[0].get("value"):
+            data = json.loads(params[0]["value"])
+            log.info("Mapping loaded from Odoo: %d suppliers, %d products",
+                     len(data.get("fournisseurs",{})), len(data.get("produits",{})))
+            return data
+    except Exception as e:
+        log.warning("Could not load mapping from Odoo: %s", e)
+    # 2. Fallback to env var
+    env_val = os.environ.get(MAPPING_ENV_KEY)
+    if env_val:
+        try:
+            return json.loads(env_val)
+        except Exception:
+            pass
+    # 3. Fallback to local file
+    if os.path.exists(MAPPING_FILE):
+        with open(MAPPING_FILE) as f:
+            return json.load(f)
+    return {"fournisseurs": {}, "produits": {}}
 
 MAPPING_HTML = r"""<!DOCTYPE html>
 <html lang="fr">
