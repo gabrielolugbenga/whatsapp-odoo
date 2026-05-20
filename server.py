@@ -2379,7 +2379,7 @@ CAT_ORDER = ["RINOU", "FAR", "VIPO", "BOI", "SEAS", "GOU", "DEJ", "VEG", "HUI", 
 
 
 def get_cat_prefix(ref):
-    if not ref:
+    if not ref or not isinstance(ref, str):
         return "AUTRE"
     ref = ref.strip("[]")
     for prefix in CAT_ORDER:
