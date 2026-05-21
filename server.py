@@ -1857,53 +1857,26 @@ def create_stock_reception(models, uid, inv, invoice_lines):
             }]
         )
 
-        # Set quantities on moves
-        moves = models.execute_kw(
-            ODOO_DB, uid, ODOO_PASSWORD, "stock.move", "search_read",
-            [[["picking_id", "=", picking_id]]],
-            {"fields": ["id", "product_uom_qty"]}
+        # Confirm the picking (ready for manual validation) — do NOT auto-validate
+        # This puts it in "Prêt" state, waiting for manual check in Odoo
+        models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD, "stock.picking", "action_confirm",
+            [[picking_id]]
         )
-        for move in moves:
-            try:
-                models.execute_kw(
-                    ODOO_DB, uid, ODOO_PASSWORD, "stock.move", "write",
-                    [[move["id"]], {"quantity": move["product_uom_qty"]}]
-                )
-            except Exception:
-                models.execute_kw(
-                    ODOO_DB, uid, ODOO_PASSWORD, "stock.move", "write",
-                    [[move["id"]], {"quantity_done": move["product_uom_qty"]}]
-                )
-
-        # Validate
-        try:
-            result = models.execute_kw(
-                ODOO_DB, uid, ODOO_PASSWORD, "stock.picking", "button_validate",
-                [[picking_id]]
-            )
-            if isinstance(result, dict) and result.get("res_model"):
-                wizard_model = result["res_model"]
-                wizard_ctx = result.get("context", {})
-                wizard_id = models.execute_kw(
-                    ODOO_DB, uid, ODOO_PASSWORD, wizard_model, "create",
-                    [{}], {"context": wizard_ctx}
-                )
-                for method in ["process", "action_done", "process_cancel_backorder"]:
-                    try:
-                        models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, wizard_model, method, [[wizard_id]])
-                        break
-                    except Exception:
-                        continue
-        except Exception as val_err:
-            log.warning("Reception validation warning: %s", val_err)
 
         picking_info = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD, "stock.picking", "read",
             [[picking_id]], {"fields": ["name", "state"]}
         )[0]
 
-        log.info("Reception %s created [%s] for %s", picking_info["name"], picking_info["state"], ref)
-        return {"reception_id": picking_id, "reception_name": picking_info["name"], "state": picking_info["state"], "lines": len(move_lines)}
+        log.info("Reception %s created [%s] for %s — awaiting manual validation",
+                 picking_info["name"], picking_info["state"], ref)
+        return {
+            "reception_id": picking_id,
+            "reception_name": picking_info["name"],
+            "state": picking_info["state"],
+            "lines": len(move_lines)
+        }
 
     except Exception as e:
         log.error("create_stock_reception error: %s", e)
@@ -3263,53 +3236,18 @@ async def receptions_create(request: Request):
                     [[move["id"]], {"quantity_done": move["product_uom_qty"]}]
                 )
 
-        # Try to validate — handle Odoo 19 wizard confirmation
-        try:
-            result = models.execute_kw(
-                ODOO_DB, uid, ODOO_PASSWORD, "stock.picking", "button_validate",
-                [[picking_id]]
-            )
-            # If result is a dict, it means Odoo returned a wizard (backorder)
-            # We need to confirm with no backorder
-            if isinstance(result, dict) and result.get("res_model"):
-                wizard_model = result["res_model"]
-                wizard_ctx = result.get("context", {})
-                log.info("Wizard required: %s", wizard_model)
-                # Create wizard and confirm
-                wizard_id = models.execute_kw(
-                    ODOO_DB, uid, ODOO_PASSWORD, wizard_model, "create",
-                    [{}], {"context": wizard_ctx}
-                )
-                # Try common confirm methods
-                for method in ["process", "action_done", "process_cancel_backorder"]:
-                    try:
-                        models.execute_kw(
-                            ODOO_DB, uid, ODOO_PASSWORD, wizard_model, method,
-                            [[wizard_id]]
-                        )
-                        log.info("Wizard confirmed via %s", method)
-                        break
-                    except Exception:
-                        continue
-        except Exception as val_err:
-            log.warning("Validation error (picking still created): %s", val_err)
-            # Return partial success — picking created but not validated
-            return {
-                "ok": True,
-                "reception_id": picking_id,
-                "reception_name": picking["name"],
-                "lines": len(stock_lines),
-                "invoice": bill["name"],
-                "warning": f"Créé mais non validé : {str(val_err)[:100]}"
-            }
+        # Confirm picking — leaves it "Prêt" for manual validation in Odoo
+        models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD, "stock.picking", "action_confirm",
+            [[picking_id]]
+        )
 
-        # Re-read picking to get final state
         picking_final = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD, "stock.picking", "read",
             [[picking_id]], {"fields": ["name", "state"]}
         )[0]
 
-        log.info("Reception %s state=%s for invoice %s (%d lines)",
+        log.info("Reception %s [%s] created for invoice %s (%d lines) — awaiting manual validation",
                  picking_final["name"], picking_final["state"], bill["name"], len(stock_lines))
 
         return {
