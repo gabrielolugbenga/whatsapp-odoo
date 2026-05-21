@@ -3078,7 +3078,7 @@ async def receptions_create(request: Request):
             uom_id = product_info["uom_id"][0] if product_info.get("uom_id") else False
 
             move_lines.append((0, 0, {
-                "name": l.get("name") or l["product_id"][1],
+                "description_picking": l.get("name") or l["product_id"][1],
                 "product_id": product_id,
                 "product_uom_qty": l["quantity"],
                 "product_uom": uom_id,
