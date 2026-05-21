@@ -3073,7 +3073,7 @@ async def receptions_create(request: Request):
             # Get product's UOM
             product_info = models.execute_kw(
                 ODOO_DB, uid, ODOO_PASSWORD, "product.product", "read",
-                [[product_id]], {"fields": ["uom_id", "uom_po_id"]}
+                [[product_id]], {"fields": ["uom_id"]}
             )[0]
             uom_id = product_info["uom_id"][0] if product_info.get("uom_id") else False
 
