@@ -2923,14 +2923,19 @@ async function createReceptions(){
   let done=0;
   for(const inv of selected){
     try{
+      log(`Traitement ${inv.name} (${inv.partner})...`,'warn');
       const r=await fetch('/receptions/create',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({invoice_id:inv.id})});
       const d=await r.json();
       if(d.error)throw new Error(d.error);
-      log(`✓ ${inv.name} (${inv.partner}) → Réception ${d.reception_name} — ${d.lines} ligne(s)`,'ok');
+      if(d.warning){
+        log(`⚠ ${inv.name} → Réception ${d.reception_name} créée (${d.lines} lignes) — ${d.warning}`,'warn');
+      } else {
+        log(`✓ ${inv.name} (${inv.partner}) → Réception ${d.reception_name} [${d.state}] — ${d.lines} ligne(s)`,'ok');
+      }
       done++;
       $('s-done').textContent=done;
     }catch(e){
-      log(`✗ ${inv.name} — ${e.message}`,'err');
+      log(`✗ ${inv.name} — ERREUR: ${e.message}`,'err');
     }
   }
   log(`Terminé — ${done}/${selected.length} réception(s) créée(s)`,'ok');
@@ -3116,23 +3121,66 @@ async def receptions_create(request: Request):
                 [[move["id"]], {"quantity_done": move["product_uom_qty"]}]
             )
 
-        # Validate the picking
-        models.execute_kw(
-            ODOO_DB, uid, ODOO_PASSWORD, "stock.picking", "button_validate",
-            [[picking_id]]
-        )
+        # Try to validate — handle Odoo 19 wizard confirmation
+        try:
+            result = models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD, "stock.picking", "button_validate",
+                [[picking_id]]
+            )
+            # If result is a dict, it means Odoo returned a wizard (backorder)
+            # We need to confirm with no backorder
+            if isinstance(result, dict) and result.get("res_model"):
+                wizard_model = result["res_model"]
+                wizard_ctx = result.get("context", {})
+                log.info("Wizard required: %s", wizard_model)
+                # Create wizard and confirm
+                wizard_id = models.execute_kw(
+                    ODOO_DB, uid, ODOO_PASSWORD, wizard_model, "create",
+                    [{}], {"context": wizard_ctx}
+                )
+                # Try common confirm methods
+                for method in ["process", "action_done", "process_cancel_backorder"]:
+                    try:
+                        models.execute_kw(
+                            ODOO_DB, uid, ODOO_PASSWORD, wizard_model, method,
+                            [[wizard_id]]
+                        )
+                        log.info("Wizard confirmed via %s", method)
+                        break
+                    except Exception:
+                        continue
+        except Exception as val_err:
+            log.warning("Validation error (picking still created): %s", val_err)
+            # Return partial success — picking created but not validated
+            return {
+                "ok": True,
+                "reception_id": picking_id,
+                "reception_name": picking["name"],
+                "lines": len(stock_lines),
+                "invoice": bill["name"],
+                "warning": f"Créé mais non validé : {str(val_err)[:100]}"
+            }
 
-        log.info("Reception created: %s for invoice %s (%d lines)",
-                 picking["name"], bill["name"], len(stock_lines))
+        # Re-read picking to get final state
+        picking_final = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD, "stock.picking", "read",
+            [[picking_id]], {"fields": ["name", "state"]}
+        )[0]
+
+        log.info("Reception %s state=%s for invoice %s (%d lines)",
+                 picking_final["name"], picking_final["state"], bill["name"], len(stock_lines))
 
         return {
             "ok": True,
             "reception_id": picking_id,
-            "reception_name": picking["name"],
+            "reception_name": picking_final["name"],
+            "state": picking_final["state"],
             "lines": len(stock_lines),
             "invoice": bill["name"]
         }
 
     except Exception as e:
         log.error("receptions_create error: %s", e)
+        import traceback
+        log.error(traceback.format_exc())
         return {"error": str(e)}
