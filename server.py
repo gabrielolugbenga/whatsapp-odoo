@@ -2759,3 +2759,380 @@ async def catalogue_pdf():
     except Exception as e:
         log.error("catalogue_pdf error: %s", e)
         return {"error": str(e)}
+
+# ── Créer réceptions depuis factures fournisseurs ──────────────────────────────
+
+RECEPTION_HTML = """<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AfriComfort — Réceptions depuis factures</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=DM+Sans:wght@300;400;500;600&display=swap');
+:root{--bg:#0d0d0d;--sur:#161616;--sur2:#1f1f1f;--brd:#2a2a2a;--acc:#00e5a0;--acd:#00e5a015;--txt:#f0f0f0;--mut:#888;--dim:#555;--red:#ff4d4d;--orn:#f0a500;--mono:'IBM Plex Mono',monospace;--sans:'DM Sans',sans-serif}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--txt);font-family:var(--sans);font-size:14px;min-height:100vh;padding:32px}
+h1{font-size:22px;font-weight:300;margin-bottom:6px}
+h1 span{color:var(--acc);font-weight:600}
+.sub{font-size:13px;color:var(--mut);margin-bottom:24px}
+.controls{display:flex;gap:12px;align-items:flex-end;margin-bottom:24px;flex-wrap:wrap}
+.field{display:flex;flex-direction:column;gap:6px}
+.field label{font-size:12px;color:var(--mut);font-family:var(--mono)}
+.field input{background:var(--sur2);border:1px solid var(--brd);border-radius:6px;padding:8px 12px;color:var(--txt);font-family:var(--mono);font-size:13px;outline:none;transition:border-color .2s}
+.field input:focus{border-color:var(--acc)}
+.btn{padding:10px 20px;background:var(--acc);color:#000;border:none;border-radius:6px;font-family:var(--mono);font-size:12px;font-weight:500;cursor:pointer;transition:opacity .2s;white-space:nowrap}
+.btn:hover{opacity:.85}
+.btn:disabled{opacity:.4;cursor:not-allowed}
+.btn-sec{background:transparent;border:1px solid var(--acc);color:var(--acc)}
+.btn-sec:hover{background:var(--acd)}
+.card{background:var(--sur);border:1px solid var(--brd);border-radius:10px;overflow:hidden;margin-bottom:16px}
+.card-header{padding:12px 18px;background:var(--sur2);border-bottom:1px solid var(--brd);display:flex;align-items:center;justify-content:space-between}
+.card-title{font-size:13px;font-weight:500}
+.card-meta{font-size:11px;color:var(--mut);font-family:var(--mono)}
+table{width:100%;border-collapse:collapse}
+th{text-align:left;padding:10px 16px;font-size:10px;font-family:var(--mono);letter-spacing:.1em;text-transform:uppercase;color:var(--dim);border-bottom:1px solid var(--brd);background:var(--sur2)}
+td{padding:10px 16px;font-size:13px;border-bottom:1px solid var(--brd);vertical-align:middle}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:var(--sur2)}
+.badge{display:inline-block;padding:2px 8px;border-radius:20px;font-size:10px;font-family:var(--mono);font-weight:500}
+.badge-ok{background:#00e5a020;color:var(--acc)}
+.badge-warn{background:#f0a50020;color:var(--orn)}
+.badge-err{background:#ff4d4d20;color:var(--red)}
+.badge-info{background:#1a3c6e30;color:#6699ff}
+.check{cursor:pointer}
+.log{background:var(--sur);border:1px solid var(--brd);border-radius:8px;padding:14px 16px;font-family:var(--mono);font-size:11px;color:var(--mut);max-height:200px;overflow-y:auto;display:flex;flex-direction:column;gap:3px;margin-top:16px}
+.ll{display:flex;gap:10px}.lt{color:var(--dim);flex-shrink:0}
+.lok{color:var(--acc)}.lerr{color:var(--red)}.lwarn{color:var(--orn)}
+.hidden{display:none!important}
+.summary{background:var(--sur);border:1px solid var(--acc);border-radius:8px;padding:14px 18px;display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:12px;margin-bottom:16px}
+.sum-item{text-align:center}
+.sum-val{font-size:24px;font-weight:600;color:var(--acc)}
+.sum-label{font-size:11px;color:var(--mut);font-family:var(--mono)}
+</style>
+</head>
+<body>
+<h1>Réceptions depuis <span>factures</span></h1>
+<div class="sub">Crée automatiquement les réceptions de stock depuis les factures fournisseurs confirmées</div>
+
+<div class="controls">
+  <div class="field">
+    <label>Date comptable FROM</label>
+    <input type="date" id="date-from" value="2026-05-20"/>
+  </div>
+  <div class="field">
+    <label>Date comptable TO</label>
+    <input type="date" id="date-to" value="2026-05-21"/>
+  </div>
+  <button class="btn" onclick="loadInvoices()">🔍 Charger les factures</button>
+</div>
+
+<div class="summary hidden" id="summary">
+  <div class="sum-item"><div class="sum-val" id="s-total">0</div><div class="sum-label">Factures trouvées</div></div>
+  <div class="sum-item"><div class="sum-val" id="s-selected">0</div><div class="sum-label">Sélectionnées</div></div>
+  <div class="sum-item"><div class="sum-val" id="s-lines">0</div><div class="sum-label">Lignes produits</div></div>
+  <div class="sum-item"><div class="sum-val" id="s-done">0</div><div class="sum-label">Réceptions créées</div></div>
+</div>
+
+<div class="card hidden" id="invoices-card">
+  <div class="card-header">
+    <div class="card-title">Factures fournisseurs confirmées</div>
+    <div style="display:flex;gap:8px">
+      <button class="btn btn-sec" onclick="selectAll(true)">Tout sélectionner</button>
+      <button class="btn btn-sec" onclick="selectAll(false)">Tout désélectionner</button>
+      <button class="btn" id="btn-create" onclick="createReceptions()">✓ Créer les réceptions</button>
+    </div>
+  </div>
+  <table>
+    <thead><tr>
+      <th style="width:40px"><input type="checkbox" id="chk-all" onchange="selectAll(this.checked)"/></th>
+      <th>Numéro</th>
+      <th>Fournisseur</th>
+      <th>Référence</th>
+      <th>Date comptable</th>
+      <th>Lignes</th>
+      <th>Statut</th>
+    </tr></thead>
+    <tbody id="invoices-body"></tbody>
+  </table>
+</div>
+
+<div class="log" id="log">
+  <div class="ll"><span class="lt">--:--:--</span><span>Prêt — sélectionne une période et charge les factures</span></div>
+</div>
+
+<script>
+let invoices = [];
+const $=id=>document.getElementById(id);
+function log(m,t=''){const l=$('log'),n=document.createElement('div'),now=new Date().toLocaleTimeString('fr-FR');n.className='ll';n.innerHTML=`<span class="lt">${now}</span><span class="${t?'l'+t:''}">${m}</span>`;l.appendChild(n);l.scrollTop=l.scrollHeight}
+
+function updateSummary(){
+  const selected = invoices.filter((_,i)=>$(`chk-${i}`)?.checked);
+  const lines = selected.reduce((s,inv)=>s+(inv.lines||0),0);
+  $('s-total').textContent = invoices.length;
+  $('s-selected').textContent = selected.length;
+  $('s-lines').textContent = lines;
+}
+
+function selectAll(v){
+  invoices.forEach((_,i)=>{const c=$(`chk-${i}`);if(c)c.checked=v});
+  $('chk-all').checked=v;
+  updateSummary();
+}
+
+async function loadInvoices(){
+  const from=$('date-from').value, to=$('date-to').value;
+  if(!from||!to){log('Sélectionne une période','err');return}
+  log(`Chargement factures du ${from} au ${to}...`,'warn');
+  try{
+    const r=await fetch(`/receptions/invoices?date_from=${from}&date_to=${to}`);
+    const d=await r.json();
+    if(d.error)throw new Error(d.error);
+    invoices=d.invoices||[];
+    log(`${invoices.length} facture(s) trouvée(s)`,'ok');
+    renderInvoices();
+    $('invoices-card').classList.remove('hidden');
+    $('summary').classList.remove('hidden');
+    $('s-done').textContent='0';
+    updateSummary();
+  }catch(e){log(`Erreur : ${e.message}`,'err')}
+}
+
+function renderInvoices(){
+  const tb=$('invoices-body');tb.innerHTML='';
+  invoices.forEach((inv,i)=>{
+    const tr=document.createElement('tr');
+    const hasProducts = inv.lines > 0;
+    tr.innerHTML=`
+      <td><input type="checkbox" id="chk-${i}" class="check" ${hasProducts?'checked':''} onchange="updateSummary()" ${hasProducts?'':'disabled'}></td>
+      <td style="font-family:var(--mono);font-size:12px">${inv.name}</td>
+      <td>${inv.partner}</td>
+      <td style="font-family:var(--mono);font-size:12px">${inv.ref||'—'}</td>
+      <td style="font-family:var(--mono);font-size:12px">${inv.date_accounting}</td>
+      <td><span class="badge ${inv.lines>0?'badge-ok':'badge-err'}">${inv.lines} ligne(s)</span></td>
+      <td><span class="badge badge-info">${inv.state}</span></td>`;
+    tb.appendChild(tr);
+  });
+}
+
+async function createReceptions(){
+  const selected=invoices.filter((_,i)=>$(`chk-${i}`)?.checked);
+  if(!selected.length){log('Aucune facture sélectionnée','err');return}
+  $('btn-create').disabled=true;
+  log(`Création de ${selected.length} réception(s)...`,'warn');
+  let done=0;
+  for(const inv of selected){
+    try{
+      const r=await fetch('/receptions/create',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({invoice_id:inv.id})});
+      const d=await r.json();
+      if(d.error)throw new Error(d.error);
+      log(`✓ ${inv.name} (${inv.partner}) → Réception ${d.reception_name} — ${d.lines} ligne(s)`,'ok');
+      done++;
+      $('s-done').textContent=done;
+    }catch(e){
+      log(`✗ ${inv.name} — ${e.message}`,'err');
+    }
+  }
+  log(`Terminé — ${done}/${selected.length} réception(s) créée(s)`,'ok');
+  $('btn-create').disabled=false;
+}
+</script>
+</body>
+</html>"""
+
+
+@app.get("/receptions", response_class=HTMLResponse)
+async def receptions_ui():
+    return HTMLResponse(content=RECEPTION_HTML)
+
+
+@app.get("/receptions/invoices")
+async def receptions_get_invoices(date_from: str, date_to: str):
+    """Fetch confirmed vendor bills in accounting date range."""
+    try:
+        models, uid = odoo_login()
+
+        bill_ids = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD, "account.move", "search",
+            [[
+                ["move_type", "=", "in_invoice"],
+                ["state", "in", ["posted"]],
+                ["date", ">=", date_from],
+                ["date", "<=", date_to],
+            ]],
+            {"order": "date asc"}
+        )
+
+        if not bill_ids:
+            return {"invoices": []}
+
+        bills = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD, "account.move", "read",
+            [bill_ids],
+            {"fields": ["id", "name", "ref", "partner_id", "date",
+                        "invoice_line_ids", "state"]}
+        )
+
+        result = []
+        for b in bills:
+            # Count lines with products
+            line_ids = b.get("invoice_line_ids", [])
+            lines_with_products = 0
+            if line_ids:
+                lines = models.execute_kw(
+                    ODOO_DB, uid, ODOO_PASSWORD, "account.move.line", "read",
+                    [line_ids], {"fields": ["product_id", "quantity"]}
+                )
+                lines_with_products = sum(
+                    1 for l in lines
+                    if l.get("product_id") and l.get("quantity", 0) > 0
+                )
+
+            result.append({
+                "id": b["id"],
+                "name": b["name"],
+                "ref": b.get("ref") or "",
+                "partner": b["partner_id"][1] if b.get("partner_id") else "—",
+                "date_accounting": str(b.get("date") or ""),
+                "state": b["state"],
+                "lines": lines_with_products,
+            })
+
+        log.info("Found %d invoices between %s and %s", len(result), date_from, date_to)
+        return {"invoices": result}
+
+    except Exception as e:
+        log.error("receptions_get_invoices error: %s", e)
+        return {"error": str(e)}
+
+
+@app.post("/receptions/create")
+async def receptions_create(request: Request):
+    """Create a stock reception from a vendor bill."""
+    try:
+        data = await request.json()
+        invoice_id = data["invoice_id"]
+        models, uid = odoo_login()
+
+        # Read invoice lines
+        bill = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD, "account.move", "read",
+            [[invoice_id]],
+            {"fields": ["id", "name", "ref", "partner_id", "invoice_line_ids"]}
+        )[0]
+
+        line_ids = bill.get("invoice_line_ids", [])
+        if not line_ids:
+            return {"error": "Aucune ligne sur cette facture"}
+
+        lines = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD, "account.move.line", "read",
+            [line_ids],
+            {"fields": ["product_id", "name", "quantity", "product_uom_id"]}
+        )
+
+        # Filter lines with products and positive qty
+        stock_lines = [
+            l for l in lines
+            if l.get("product_id") and l.get("quantity", 0) > 0
+        ]
+
+        if not stock_lines:
+            return {"error": "Aucune ligne avec produit trouvée"}
+
+        # Find WH/IN picking type
+        picking_types = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD, "stock.picking.type", "search_read",
+            [[["code", "=", "incoming"], ["warehouse_id.active", "=", True]]],
+            {"fields": ["id", "name", "default_location_dest_id"], "limit": 1}
+        )
+        if not picking_types:
+            return {"error": "Aucun type de réception trouvé (WH/IN)"}
+
+        picking_type = picking_types[0]
+        dest_location_id = picking_type["default_location_dest_id"][0]
+
+        # Find source location (supplier)
+        supplier_locations = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD, "stock.location", "search",
+            [[["usage", "=", "supplier"]]],
+            {"limit": 1}
+        )
+        src_location_id = supplier_locations[0] if supplier_locations else False
+
+        # Build move lines
+        move_lines = []
+        for l in stock_lines:
+            product_id = l["product_id"][0]
+
+            # Get product's UOM
+            product_info = models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD, "product.product", "read",
+                [[product_id]], {"fields": ["uom_id", "uom_po_id"]}
+            )[0]
+            uom_id = product_info["uom_id"][0] if product_info.get("uom_id") else False
+
+            move_lines.append((0, 0, {
+                "name": l.get("name") or l["product_id"][1],
+                "product_id": product_id,
+                "product_uom_qty": l["quantity"],
+                "product_uom": uom_id,
+                "location_id": src_location_id,
+                "location_dest_id": dest_location_id,
+            }))
+
+        # Create picking (reception)
+        partner_id = bill["partner_id"][0] if bill.get("partner_id") else False
+        origin = f"{bill['name']} / {bill.get('ref') or ''}"
+
+        picking_id = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD, "stock.picking", "create",
+            [{
+                "picking_type_id": picking_type["id"],
+                "partner_id": partner_id,
+                "origin": origin.strip(" /"),
+                "location_id": src_location_id,
+                "location_dest_id": dest_location_id,
+                "move_ids": move_lines,
+            }]
+        )
+
+        # Validate immediately (mark as done)
+        picking = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD, "stock.picking", "read",
+            [[picking_id]], {"fields": ["name", "state"]}
+        )[0]
+
+        # Set qty_done on move lines then validate
+        moves = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD, "stock.move", "search_read",
+            [[["picking_id", "=", picking_id]]],
+            {"fields": ["id", "product_uom_qty"]}
+        )
+        for move in moves:
+            # Create move line done
+            models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD, "stock.move", "write",
+                [[move["id"]], {"quantity_done": move["product_uom_qty"]}]
+            )
+
+        # Validate the picking
+        models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD, "stock.picking", "button_validate",
+            [[picking_id]]
+        )
+
+        log.info("Reception created: %s for invoice %s (%d lines)",
+                 picking["name"], bill["name"], len(stock_lines))
+
+        return {
+            "ok": True,
+            "reception_id": picking_id,
+            "reception_name": picking["name"],
+            "lines": len(stock_lines),
+            "invoice": bill["name"]
+        }
+
+    except Exception as e:
+        log.error("receptions_create error: %s", e)
+        return {"error": str(e)}
