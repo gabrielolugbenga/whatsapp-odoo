@@ -1536,7 +1536,12 @@ async function push(){
     if(d.error)throw new Error(d.error);
     log(`✓ Facture créée dans Odoo — ID: ${d.bill_id}`,'ok');
     log(`✓ ${inv.lignes.length} ligne(s) importée(s)`,'ok');
-    status(`Facture ${inv.reference} envoyée dans Odoo (ID: ${d.bill_id})`,'ok');
+    if(d.reception && d.reception.reception_name){
+      log(`✓ Réception stock: ${d.reception.reception_name} [${d.reception.state}] — ${d.reception.lines} ligne(s)`,'ok');
+    } else if(d.reception && d.reception.error){
+      log(`⚠ Stock non mis à jour: ${d.reception.error}`,'warn');
+    }
+    status(`Facture ${inv.reference} → Odoo ✓ + Stock ✓`,'ok');
     $('bp').textContent='✓ Envoyé dans Odoo';
   }catch(e){log(`Erreur push : ${e.message}`,'err');status('Erreur envoi Odoo','err');$('bp').disabled=false}
 }
@@ -1768,10 +1773,140 @@ async def invoice_push(request: Request):
             }]
         )
         log.info("Bill ID=%s — %d lines, %d unmatched", bill_id, len(lines), len(unmatched))
-        return {"bill_id": bill_id, "lines": len(lines), "unmatched": unmatched, "partner_found": bool(partner_id)}
+
+        # Create stock reception automatically
+        reception_result = create_stock_reception(models, uid, inv, lines)
+        log.info("Reception result: %s", reception_result)
+
+        return {
+            "bill_id": bill_id,
+            "lines": len(lines),
+            "unmatched": unmatched,
+            "partner_found": bool(partner_id),
+            "reception": reception_result
+        }
 
     except Exception as e:
         log.error("Invoice push error: %s", e)
+        return {"error": str(e)}
+
+
+def create_stock_reception(models, uid, inv, invoice_lines):
+    """Create and validate a stock reception from invoice data."""
+    try:
+        # Find WH/IN picking type
+        picking_types = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD, "stock.picking.type", "search_read",
+            [[["code", "=", "incoming"], ["warehouse_id.active", "=", True]]],
+            {"fields": ["id", "name", "default_location_dest_id"], "limit": 1}
+        )
+        if not picking_types:
+            return {"error": "Aucun type réception WH/IN trouvé"}
+
+        picking_type = picking_types[0]
+        dest_location_id = picking_type["default_location_dest_id"][0]
+
+        supplier_locations = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD, "stock.location", "search",
+            [[["usage", "=", "supplier"]]], {"limit": 1}
+        )
+        src_location_id = supplier_locations[0] if supplier_locations else False
+
+        # Build stock moves from invoice lines that have product_id
+        move_lines = []
+        for line_cmd in invoice_lines:
+            # invoice_lines are (0, 0, vals) tuples
+            vals = line_cmd[2] if isinstance(line_cmd, (list, tuple)) and len(line_cmd) == 3 else {}
+            product_id = vals.get("product_id")
+            qty = vals.get("quantity", 0)
+            if not product_id or qty <= 0:
+                continue
+
+            product_info = models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD, "product.product", "read",
+                [[product_id]], {"fields": ["uom_id", "name"]}
+            )[0]
+            uom_id = product_info["uom_id"][0] if product_info.get("uom_id") else False
+
+            move_lines.append((0, 0, {
+                "product_id": product_id,
+                "product_uom_qty": qty,
+                "product_uom": uom_id,
+                "location_id": src_location_id,
+                "location_dest_id": dest_location_id,
+            }))
+
+        if not move_lines:
+            return {"error": "Aucune ligne avec produit pour la réception"}
+
+        # Find partner
+        supplier_name = inv.get("fournisseur", "")
+        partner_id = find_partner_by_name(models, uid, supplier_name) or False
+        ref = inv.get("reference", "")
+
+        # Create picking
+        picking_id = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD, "stock.picking", "create",
+            [{
+                "picking_type_id": picking_type["id"],
+                "partner_id": partner_id,
+                "origin": f"Facture {ref}".strip(),
+                "location_id": src_location_id,
+                "location_dest_id": dest_location_id,
+                "move_ids": move_lines,
+            }]
+        )
+
+        # Set quantities on moves
+        moves = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD, "stock.move", "search_read",
+            [[["picking_id", "=", picking_id]]],
+            {"fields": ["id", "product_uom_qty"]}
+        )
+        for move in moves:
+            try:
+                models.execute_kw(
+                    ODOO_DB, uid, ODOO_PASSWORD, "stock.move", "write",
+                    [[move["id"]], {"quantity": move["product_uom_qty"]}]
+                )
+            except Exception:
+                models.execute_kw(
+                    ODOO_DB, uid, ODOO_PASSWORD, "stock.move", "write",
+                    [[move["id"]], {"quantity_done": move["product_uom_qty"]}]
+                )
+
+        # Validate
+        try:
+            result = models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD, "stock.picking", "button_validate",
+                [[picking_id]]
+            )
+            if isinstance(result, dict) and result.get("res_model"):
+                wizard_model = result["res_model"]
+                wizard_ctx = result.get("context", {})
+                wizard_id = models.execute_kw(
+                    ODOO_DB, uid, ODOO_PASSWORD, wizard_model, "create",
+                    [{}], {"context": wizard_ctx}
+                )
+                for method in ["process", "action_done", "process_cancel_backorder"]:
+                    try:
+                        models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, wizard_model, method, [[wizard_id]])
+                        break
+                    except Exception:
+                        continue
+        except Exception as val_err:
+            log.warning("Reception validation warning: %s", val_err)
+
+        picking_info = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD, "stock.picking", "read",
+            [[picking_id]], {"fields": ["name", "state"]}
+        )[0]
+
+        log.info("Reception %s created [%s] for %s", picking_info["name"], picking_info["state"], ref)
+        return {"reception_id": picking_id, "reception_name": picking_info["name"], "state": picking_info["state"], "lines": len(move_lines)}
+
+    except Exception as e:
+        log.error("create_stock_reception error: %s", e)
         return {"error": str(e)}
 
 
