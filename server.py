@@ -3108,18 +3108,25 @@ async def receptions_create(request: Request):
             [[picking_id]], {"fields": ["name", "state"]}
         )[0]
 
-        # Set qty_done on move lines then validate
+        # Set quantity on move lines (Odoo 19: quantity_done renamed to quantity)
         moves = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD, "stock.move", "search_read",
             [[["picking_id", "=", picking_id]]],
             {"fields": ["id", "product_uom_qty"]}
         )
         for move in moves:
-            # Create move line done
-            models.execute_kw(
-                ODOO_DB, uid, ODOO_PASSWORD, "stock.move", "write",
-                [[move["id"]], {"quantity_done": move["product_uom_qty"]}]
-            )
+            try:
+                # Odoo 19 uses 'quantity'
+                models.execute_kw(
+                    ODOO_DB, uid, ODOO_PASSWORD, "stock.move", "write",
+                    [[move["id"]], {"quantity": move["product_uom_qty"]}]
+                )
+            except Exception:
+                # Fallback for older versions
+                models.execute_kw(
+                    ODOO_DB, uid, ODOO_PASSWORD, "stock.move", "write",
+                    [[move["id"]], {"quantity_done": move["product_uom_qty"]}]
+                )
 
         # Try to validate — handle Odoo 19 wizard confirmation
         try:
