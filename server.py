@@ -2010,6 +2010,7 @@ select:focus,input:focus{border-color:var(--acc)}
     <div class="tab" onclick="showTab('products')">Produits & conditionnement</div>
   </div>
   <button class="btn" onclick="learnFromOdoo()" id="btn-learn">🧠 Apprendre depuis Odoo</button>
+  <button class="btn" onclick="scanInvoices()" id="btn-scan" style="background:var(--sur2);border:1px solid var(--acc);color:var(--acc)">📎 Scanner les PJ factures</button>
 </div>
 <div style="border-bottom:1px solid var(--brd);margin-bottom:24px"></div>
 
@@ -2226,6 +2227,30 @@ async function learnFromOdoo(){
   }finally{
     btn.disabled=false;
     btn.textContent='🧠 Apprendre depuis Odoo';
+  }
+}
+
+async function scanInvoices(){
+  const btn = $('btn-scan');
+  btn.disabled=true;
+  btn.textContent='⏳ Scan en cours...';
+  log('Scan des pièces jointes factures — cela peut prendre 2-3 minutes...','warn');
+  try{
+    const r = await fetch('/mapping/scan-invoices');
+    const d = await r.json();
+    if(d.error)throw new Error(d.error);
+    log(`✓ ${d.bills_scanned} factures scannées — ${d.new_entries} nouveaux produits ajoutés`,'ok');
+    log(`Total produits mappés : ${d.total_products}`,'ok');
+    const md = await fetch('/mapping/load').then(r=>r.json());
+    mapping = md;
+    renderSuppliers();
+    renderProducts();
+    log('Mapping enrichi — vérifie les nouveaux produits et ajuste les conditionnements','ok');
+  }catch(e){
+    log(`Erreur : ${e.message}`,'err');
+  }finally{
+    btn.disabled=false;
+    btn.textContent='📎 Scanner les PJ factures';
   }
 }
 
@@ -3263,4 +3288,169 @@ async def receptions_create(request: Request):
         log.error("receptions_create error: %s", e)
         import traceback
         log.error(traceback.format_exc())
+        return {"error": str(e)}
+
+# ── Scan factures PJ pour enrichir le mapping ──────────────────────────────────
+
+@app.get("/mapping/scan-invoices")
+async def mapping_scan_invoices():
+    """
+    Read all vendor bills with attachments, extract product names from
+    the original invoice images/PDFs using Claude, then match with Odoo
+    product lines to build the mapping automatically.
+    """
+    try:
+        models, uid = odoo_login()
+        log.info("Scanning invoice attachments for mapping...")
+
+        # 1. Fetch all posted vendor bills with their lines
+        bill_ids = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD, "account.move", "search",
+            [[["move_type", "=", "in_invoice"], ["state", "=", "posted"]]],
+            {"limit": 200, "order": "date desc"}
+        )
+        if not bill_ids:
+            return {"error": "Aucune facture trouvée"}
+
+        bills = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD, "account.move", "read",
+            [bill_ids],
+            {"fields": ["id", "name", "ref", "partner_id", "invoice_line_ids"]}
+        )
+        log.info("Found %d bills to scan", len(bills))
+
+        # 2. For each bill, get lines with product + attachment
+        existing = load_mapping()
+        new_entries = 0
+        processed = 0
+
+        for bill in bills:
+            partner_name = bill["partner_id"][1] if bill.get("partner_id") else "Unknown"
+            line_ids = bill.get("invoice_line_ids", [])
+            if not line_ids:
+                continue
+
+            # Read lines with product info
+            lines = models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD, "account.move.line", "read",
+                [line_ids],
+                {"fields": ["product_id", "name", "quantity"]}
+            )
+            # Only lines with mapped products and positive qty
+            product_lines = [
+                l for l in lines
+                if l.get("product_id") and l.get("quantity", 0) > 0
+                and not str(l.get("name", "")).startswith("[A LIER]")
+            ]
+            if not product_lines:
+                continue
+
+            # Get attachment for this bill
+            attachments = models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD, "ir.attachment", "search_read",
+                [[["res_model", "=", "account.move"], ["res_id", "=", bill["id"]],
+                  ["mimetype", "in", ["image/jpeg", "image/png", "image/jpg",
+                                      "application/pdf", "image/webp"]]]],
+                {"fields": ["id", "name", "mimetype", "datas"], "limit": 1}
+            )
+            if not attachments:
+                continue
+
+            att = attachments[0]
+            b64 = att.get("datas")
+            mime = att.get("mimetype", "image/jpeg")
+            if not b64:
+                continue
+
+            # Build expected products list for Claude context
+            expected = [
+                {"odoo_id": l["product_id"][0], "odoo_name": l["product_id"][1], "qty": l["quantity"]}
+                for l in product_lines
+            ]
+
+            # Ask Claude to extract invoice product names and match to Odoo products
+            prompt = f"""This is a supplier invoice from {partner_name}.
+
+The following products were recorded in Odoo from this invoice:
+{json.dumps(expected, ensure_ascii=False)}
+
+Look at the invoice image/PDF and for each Odoo product above, find the EXACT name/description 
+as it appears on the supplier's invoice (could be in French, English, Italian or other language).
+
+Return ONLY a JSON array, no markdown:
+[
+  {{
+    "odoo_id": <integer>,
+    "odoo_name": "name in Odoo",
+    "invoice_name": "EXACT NAME AS ON SUPPLIER INVOICE IN CAPITALS",
+    "supplier": "{partner_name}"
+  }}
+]
+
+If you cannot find a match for a product, omit it from the array.
+Return [] if the image is unreadable."""
+
+            try:
+                if mime.startswith("image/"):
+                    content = [
+                        {"type": "image", "source": {"type": "base64", "media_type": mime, "data": b64}},
+                        {"type": "text", "text": prompt}
+                    ]
+                else:
+                    content = [
+                        {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": b64}},
+                        {"type": "text", "text": prompt}
+                    ]
+
+                resp = anthropic_client.messages.create(
+                    model="claude-sonnet-4-6",
+                    max_tokens=2000,
+                    messages=[{"role": "user", "content": content}]
+                )
+                raw = resp.content[0].text.strip().replace("```json", "").replace("```", "").strip()
+                matches = json.loads(raw)
+
+                for m in matches:
+                    invoice_name = m.get("invoice_name", "").strip().upper()
+                    odoo_id = m.get("odoo_id")
+                    odoo_name = m.get("odoo_name", "")
+                    supplier = m.get("supplier", partner_name)
+
+                    if not invoice_name or not odoo_id:
+                        continue
+
+                    # Don't overwrite existing entries
+                    if invoice_name in existing["produits"]:
+                        continue
+
+                    existing["produits"][invoice_name] = {
+                        "odoo_id": odoo_id,
+                        "odoo_name": odoo_name,
+                        "facteur": 1,
+                        "note": f"Auto-mapped from {supplier}"
+                    }
+                    new_entries += 1
+                    log.info("New mapping: '%s' -> %s (id:%s)", invoice_name, odoo_name, odoo_id)
+
+                processed += 1
+                log.info("Processed bill %s (%d/%d) — %d new entries so far",
+                         bill["name"], processed, len(bills), new_entries)
+
+            except Exception as e:
+                log.warning("Could not process bill %s: %s", bill["name"], e)
+                continue
+
+        # Save enriched mapping
+        if new_entries > 0:
+            save_mapping(existing)
+
+        return {
+            "ok": True,
+            "bills_scanned": processed,
+            "new_entries": new_entries,
+            "total_products": len(existing["produits"])
+        }
+
+    except Exception as e:
+        log.error("scan_invoices error: %s", e)
         return {"error": str(e)}
