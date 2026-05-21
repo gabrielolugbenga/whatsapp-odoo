@@ -2449,9 +2449,9 @@ def make_cover(styles):
     elems = []
     elems.append(Spacer(1, 20*mm))
 
-    # Logo on cream background
+    # Logo on cover — use light JPG (white background, clean)
     try:
-        logo = logo_image(LOGO_DARK_B64, 80, 80)
+        logo = logo_image(LOGO_LIGHT_B64, 90, 75)
         logo.hAlign = "CENTER"
         elems.append(logo)
     except Exception:
@@ -2572,26 +2572,21 @@ def build_catalogue_pdf(products):
         canvas.setFillColor(BRAND_BROWN)
         canvas.rect(0, PAGE_H - 20*mm, PAGE_W, 1*mm, fill=1, stroke=0)
 
-        # Logo in header
+        # Logo in header — use light JPG (white background)
         try:
             img_bytes = base64.b64decode(LOGO_LIGHT_B64)
             img_buf = io.BytesIO(img_bytes)
-            canvas.drawImage(img_buf, 10*mm, PAGE_H - 19*mm,
-                           width=18*mm, height=17*mm,
-                           preserveAspectRatio=True, mask="auto")
+            canvas.drawImage(img_buf, 8*mm, PAGE_H - 19*mm,
+                           width=22*mm, height=18*mm,
+                           preserveAspectRatio=True, mask=None)
         except Exception:
             canvas.setFillColor(BRAND_BROWN)
             canvas.setFont("Helvetica-Bold", 10)
-            canvas.drawString(15*mm, PAGE_H - 12*mm, "AFRICOMFORT FOODS")
+            canvas.drawString(15*mm, PAGE_H - 12*mm, "Africomfort Foods")
 
-        # Header text
-        canvas.setFillColor(BRAND_BROWN)
-        canvas.setFont("Helvetica-Bold", 9)
-        canvas.drawString(32*mm, PAGE_H - 11*mm, "AFRICOMFORT FOODS")
+        # Header right text only — no duplicate name
+        canvas.setFont("Helvetica", 8)
         canvas.setFillColor(TEXT_MUTED)
-        canvas.setFont("Helvetica", 8)
-        canvas.drawString(32*mm, PAGE_H - 16*mm, "A Taste of Home")
-        canvas.setFont("Helvetica", 8)
         canvas.drawRightString(PAGE_W - 12*mm, PAGE_H - 11*mm,
                                "Catalogue 2026 — Épicerie africaine & caribéenne")
         canvas.drawRightString(PAGE_W - 12*mm, PAGE_H - 16*mm,
