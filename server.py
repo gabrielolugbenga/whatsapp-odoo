@@ -3454,3 +3454,289 @@ Return [] if the image is unreadable."""
     except Exception as e:
         log.error("scan_invoices error: %s", e)
         return {"error": str(e)}
+
+# ── Analyse des marges produits ────────────────────────────────────────────────
+
+@app.get("/products/margins")
+async def products_margins():
+    """Generate an Excel file with all products, costs, prices and margins."""
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import (Font, PatternFill, Alignment,
+                                      Border, Side, numbers)
+        from openpyxl.utils import get_column_letter
+        from openpyxl.formatting.rule import ColorScaleRule, CellIsRule
+        import io as _io
+
+        models, uid = odoo_login()
+        log.info("Fetching products for margin analysis...")
+
+        # Fetch all active saleable products
+        product_ids = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD, "product.template", "search",
+            [[["active", "=", True], ["sale_ok", "=", True]]],
+            {"limit": 1000}
+        )
+        products = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD, "product.template", "read",
+            [product_ids],
+            {"fields": [
+                "id", "name", "default_code", "categ_id",
+                "list_price", "standard_price", "type",
+                "qty_available", "uom_id"
+            ]}
+        )
+        log.info("Fetched %d products", len(products))
+
+        # Sort by category then name
+        products.sort(key=lambda p: (
+            (p.get("categ_id") or [0, ""])[1],
+            p.get("default_code") or p.get("name", "")
+        ))
+
+        # ── Build Excel ────────────────────────────────────────────────────────
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Analyse Marges"
+
+        # Colors
+        C_DARK   = "1A1A1A"
+        C_BROWN  = "5C2E0A"
+        C_GOLD   = "C9A84C"
+        C_CREAM  = "FAF7F2"
+        C_WHITE  = "FFFFFF"
+        C_GREEN  = "D6F0E8"
+        C_RED    = "FFE0E0"
+        C_GRAY   = "F5F5F5"
+        C_HEADER = "2D2D2D"
+
+        thin = Side(style="thin", color="DDDDDD")
+        border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+        def fill(color):
+            return PatternFill("solid", fgColor=color)
+
+        def font(bold=False, color=C_DARK, size=10, italic=False):
+            return Font(name="Arial", bold=bold, color=color,
+                       size=size, italic=italic)
+
+        def align(h="left", v="center", wrap=False):
+            return Alignment(horizontal=h, vertical=v, wrap_text=wrap)
+
+        # ── Title row ─────────────────────────────────────────────────────────
+        ws.merge_cells("A1:J1")
+        ws["A1"] = "AFRICOMFORT FOODS — Analyse des marges produits"
+        ws["A1"].font = Font(name="Arial", bold=True, size=14, color=C_WHITE)
+        ws["A1"].fill = fill(C_BROWN)
+        ws["A1"].alignment = align("center")
+        ws.row_dimensions[1].height = 28
+
+        ws.merge_cells("A2:J2")
+        from datetime import date
+        ws["A2"] = f"Généré le {date.today().strftime('%d/%m/%Y')} — Prix HT en EUR"
+        ws["A2"].font = font(italic=True, color="888888", size=9)
+        ws["A2"].alignment = align("center")
+        ws.row_dimensions[2].height = 16
+
+        # ── Headers ───────────────────────────────────────────────────────────
+        headers = [
+            ("Réf.", 12),
+            ("Nom du produit", 42),
+            ("Catégorie", 20),
+            ("Unité", 10),
+            ("Prix achat HT\n(€)", 14),
+            ("Prix vente HT\n(€)", 14),
+            ("Marge €", 12),
+            ("Marge %", 10),
+            ("Stock", 10),
+            ("Valeur stock\n(€)", 14),
+        ]
+
+        for col, (h, w) in enumerate(headers, 1):
+            cell = ws.cell(row=3, column=col, value=h)
+            cell.font = Font(name="Arial", bold=True, size=10,
+                           color=C_WHITE)
+            cell.fill = fill(C_HEADER)
+            cell.alignment = Alignment(horizontal="center", vertical="center",
+                                      wrap_text=True)
+            cell.border = border
+            ws.column_dimensions[get_column_letter(col)].width = w
+        ws.row_dimensions[3].height = 32
+
+        # ── Data rows ─────────────────────────────────────────────────────────
+        current_cat = None
+        row = 4
+
+        for p in products:
+            cat = (p.get("categ_id") or [0, "Sans catégorie"])[1]
+            name = p.get("name") or ""
+            ref = p.get("default_code") or ""
+            if not isinstance(ref, str): ref = ""
+            uom = (p.get("uom_id") or [0, ""])[1]
+            cost = float(p.get("standard_price") or 0)
+            price = float(p.get("list_price") or 0)
+            qty = float(p.get("qty_available") or 0)
+
+            # Category separator row
+            if cat != current_cat:
+                current_cat = cat
+                ws.merge_cells(f"A{row}:J{row}")
+                ws[f"A{row}"] = cat
+                ws[f"A{row}"].font = Font(name="Arial", bold=True,
+                                          size=10, color=C_WHITE)
+                ws[f"A{row}"].fill = fill(C_GOLD)
+                ws[f"A{row}"].alignment = align("left")
+                ws.row_dimensions[row].height = 20
+                row += 1
+
+            # Alternating row color
+            bg = C_GRAY if row % 2 == 0 else C_WHITE
+
+            values = [ref, name, cat, uom, cost, price,
+                      f"=G{row}-F{row}",
+                      f"=IF(F{row}=0,\"\",H{row}/F{row})",
+                      qty,
+                      f"=I{row}*F{row}"]
+
+            for col, val in enumerate(values, 1):
+                cell = ws.cell(row=row, column=col, value=val)
+                cell.fill = fill(bg)
+                cell.border = border
+                cell.font = font()
+                cell.alignment = align(
+                    "right" if col >= 5 else "left"
+                )
+
+            # Number formats
+            for col in [5, 6, 7, 10]:
+                ws.cell(row=row, column=col).number_format = '#,##0.00 €'
+            ws.cell(row=row, column=8).number_format = '0.0%'
+            ws.cell(row=row, column=9).number_format = '#,##0'
+
+            ws.row_dimensions[row].height = 18
+            row += 1
+
+        # ── Totals row ────────────────────────────────────────────────────────
+        ws.merge_cells(f"A{row}:D{row}")
+        ws[f"A{row}"] = "TOTAL / MOYENNE"
+        ws[f"A{row}"].font = Font(name="Arial", bold=True, size=10,
+                                  color=C_WHITE)
+        ws[f"A{row}"].fill = fill(C_BROWN)
+        ws[f"A{row}"].alignment = align("center")
+
+        for col, formula in [
+            (5, f"=AVERAGE(E4:E{row-1})"),
+            (6, f"=AVERAGE(F4:F{row-1})"),
+            (7, f"=AVERAGE(G4:G{row-1})"),
+            (8, f"=AVERAGE(H4:H{row-1})"),
+            (9, f"=SUM(I4:I{row-1})"),
+            (10, f"=SUM(J4:J{row-1})"),
+        ]:
+            cell = ws.cell(row=row, column=col, value=formula)
+            cell.font = Font(name="Arial", bold=True, size=10, color=C_WHITE)
+            cell.fill = fill(C_BROWN)
+            cell.border = border
+            cell.alignment = align("right")
+
+        ws.cell(row=row, column=5).number_format = '#,##0.00 €'
+        ws.cell(row=row, column=6).number_format = '#,##0.00 €'
+        ws.cell(row=row, column=7).number_format = '#,##0.00 €'
+        ws.cell(row=row, column=8).number_format = '0.0%'
+        ws.cell(row=row, column=9).number_format = '#,##0'
+        ws.cell(row=row, column=10).number_format = '#,##0.00 €'
+        ws.row_dimensions[row].height = 22
+
+        # ── Conditional formatting on margin % ────────────────────────────────
+        # Red if margin < 20%, orange 20-35%, green > 35%
+        margin_range = f"H4:H{row-1}"
+        ws.conditional_formatting.add(margin_range, CellIsRule(
+            operator="lessThan", formula=["0.20"],
+            fill=PatternFill("solid", fgColor="FFD0D0")
+        ))
+        ws.conditional_formatting.add(margin_range, CellIsRule(
+            operator="between", formula=["0.20", "0.35"],
+            fill=PatternFill("solid", fgColor="FFF3CD")
+        ))
+        ws.conditional_formatting.add(margin_range, CellIsRule(
+            operator="greaterThan", formula=["0.35"],
+            fill=PatternFill("solid", fgColor="D4EDDA")
+        ))
+
+        # ── Freeze panes & filters ────────────────────────────────────────────
+        ws.freeze_panes = "A4"
+        ws.auto_filter.ref = f"A3:J{row-1}"
+
+        # ── Second sheet: summary by category ────────────────────────────────
+        ws2 = wb.create_sheet("Par catégorie")
+        ws2["A1"] = "Résumé par catégorie"
+        ws2["A1"].font = Font(name="Arial", bold=True, size=13, color=C_WHITE)
+        ws2["A1"].fill = fill(C_BROWN)
+        ws2.merge_cells("A1:F1")
+        ws2["A1"].alignment = align("center")
+
+        cat_headers = ["Catégorie", "Nb produits", "Prix achat moy.",
+                       "Prix vente moy.", "Marge moy. €", "Marge moy. %"]
+        for col, h in enumerate(cat_headers, 1):
+            c = ws2.cell(row=2, column=col, value=h)
+            c.font = Font(name="Arial", bold=True, size=10, color=C_WHITE)
+            c.fill = fill(C_HEADER)
+            c.alignment = align("center")
+            c.border = border
+
+        ws2.column_dimensions["A"].width = 30
+        for col in ["B","C","D","E","F"]:
+            ws2.column_dimensions[col].width = 16
+
+        # Group by category
+        from collections import defaultdict
+        cat_data = defaultdict(list)
+        for p in products:
+            cat = (p.get("categ_id") or [0, "Sans catégorie"])[1]
+            cost = float(p.get("standard_price") or 0)
+            price = float(p.get("list_price") or 0)
+            cat_data[cat].append({"cost": cost, "price": price})
+
+        r2 = 3
+        for cat, items in sorted(cat_data.items()):
+            n = len(items)
+            avg_cost = sum(i["cost"] for i in items) / n if n else 0
+            avg_price = sum(i["price"] for i in items) / n if n else 0
+            avg_margin = avg_price - avg_cost
+            avg_pct = avg_margin / avg_price if avg_price else 0
+
+            bg2 = C_GRAY if r2 % 2 == 0 else C_WHITE
+            row_vals = [cat, n, avg_cost, avg_price, avg_margin, avg_pct]
+            for col, val in enumerate(row_vals, 1):
+                c = ws2.cell(row=r2, column=col, value=val)
+                c.fill = fill(bg2)
+                c.border = border
+                c.font = font()
+                c.alignment = align("right" if col > 1 else "left")
+
+            ws2.cell(row=r2, column=3).number_format = '#,##0.00 €'
+            ws2.cell(row=r2, column=4).number_format = '#,##0.00 €'
+            ws2.cell(row=r2, column=5).number_format = '#,##0.00 €'
+            ws2.cell(row=r2, column=6).number_format = '0.0%'
+            ws2.row_dimensions[r2].height = 18
+            r2 += 1
+
+        # ── Save & return ─────────────────────────────────────────────────────
+        buf = _io.BytesIO()
+        wb.save(buf)
+        buf.seek(0)
+
+        from datetime import date as _date
+        filename = f"AfriComfort_Marges_{_date.today().strftime('%Y%m%d')}.xlsx"
+        log.info("Margins Excel generated: %d products", len(products))
+
+        return StreamingResponse(
+            buf,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
+
+    except Exception as e:
+        log.error("products_margins error: %s", e)
+        import traceback
+        log.error(traceback.format_exc())
+        return {"error": str(e)}
