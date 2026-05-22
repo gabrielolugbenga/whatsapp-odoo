@@ -3593,8 +3593,8 @@ async def products_margins():
             bg = C_GRAY if row % 2 == 0 else C_WHITE
 
             values = [ref, name, cat, uom, cost, price,
-                      f"=G{row}-F{row}",
-                      f"=IF(F{row}=0,\"\",H{row}/F{row})",
+                      f"=F{row}-E{row}",
+                      f"=IF(F{row}=0,\"\",G{row}/F{row})",
                       qty,
                       f"=I{row}*F{row}"]
 
@@ -3625,10 +3625,10 @@ async def products_margins():
         ws[f"A{row}"].alignment = align("center")
 
         for col, formula in [
-            (5, f"=AVERAGE(E4:E{row-1})"),
-            (6, f"=AVERAGE(F4:F{row-1})"),
-            (7, f"=AVERAGE(G4:G{row-1})"),
-            (8, f"=AVERAGE(H4:H{row-1})"),
+            (5, f"=AVERAGEIF(E4:E{row-1},\"<>0\")"),
+            (6, f"=AVERAGEIF(F4:F{row-1},\"<>0\")"),
+            (7, f"=AVERAGEIF(G4:G{row-1},\"<>0\")"),
+            (8, f"=AVERAGEIF(H4:H{row-1},\"<>0\")"),
             (9, f"=SUM(I4:I{row-1})"),
             (10, f"=SUM(J4:J{row-1})"),
         ]:
