@@ -1536,12 +1536,20 @@ async function push(){
     if(d.error)throw new Error(d.error);
     log(`✓ Facture créée dans Odoo — ID: ${d.bill_id}`,'ok');
     log(`✓ ${inv.lignes.length} ligne(s) importée(s)`,'ok');
+    if(d.attachment && d.attachment.ok){
+      log(`✓ PJ attachée : ${d.attachment.filename}`,'ok');
+    } else if(d.attachment && !d.attachment.ok){
+      log(`⚠ PJ non attachée : ${d.attachment.error}`,'warn');
+    }
+    if(d.price_updates > 0){
+      log(`✓ Prix d'achat mis à jour : ${d.price_updates} produit(s)`,'ok');
+    }
     if(d.reception && d.reception.reception_name){
       log(`✓ Réception stock: ${d.reception.reception_name} [${d.reception.state}] — ${d.reception.lines} ligne(s)`,'ok');
     } else if(d.reception && d.reception.error){
       log(`⚠ Stock non mis à jour: ${d.reception.error}`,'warn');
     }
-    status(`Facture ${inv.reference} → Odoo ✓ + Stock ✓`,'ok');
+    status(`Facture ${inv.reference} → Odoo ✓ + PJ ✓ + Prix ✓ + Stock ✓`,'ok');
     $('bp').textContent='✓ Envoyé dans Odoo';
   }catch(e){log(`Erreur push : ${e.message}`,'err');status('Erreur envoi Odoo','err');$('bp').disabled=false}
 }
@@ -1559,6 +1567,9 @@ async def invoice_ui():
     return HTMLResponse(content=INVOICE_HTML)
 
 
+# Store file content globally for attachment after push
+_last_uploaded_file: dict = {}
+
 @app.post("/invoice/extract")
 async def invoice_extract(file: UploadFile = File(...)):
     try:
@@ -1566,6 +1577,13 @@ async def invoice_extract(file: UploadFile = File(...)):
         b64 = base64.b64encode(content).decode()
         mime = file.content_type or "application/octet-stream"
         log.info("Invoice extract: %s (%d bytes)", file.filename, len(content))
+        # Store file for later attachment
+        _last_uploaded_file.clear()
+        _last_uploaded_file.update({
+            "b64": b64,
+            "mime": mime,
+            "filename": file.filename or "facture"
+        })
 
         if mime.startswith("image/"):
             msg_content = [
@@ -1774,7 +1792,63 @@ async def invoice_push(request: Request):
         )
         log.info("Bill ID=%s — %d lines, %d unmatched", bill_id, len(lines), len(unmatched))
 
-        # Create stock reception automatically
+        # 1. Attach original invoice file to the bill
+        attachment_result = None
+        if _last_uploaded_file.get("b64"):
+            try:
+                file_b64 = _last_uploaded_file["b64"]
+                file_mime = _last_uploaded_file.get("mime", "image/jpeg")
+                file_name = _last_uploaded_file.get("filename", "facture")
+                # Add extension if missing
+                if "." not in file_name:
+                    ext = "pdf" if "pdf" in file_mime else "jpg"
+                    file_name = f"{file_name}.{ext}"
+                att_id = models.execute_kw(
+                    ODOO_DB, uid, ODOO_PASSWORD, "ir.attachment", "create",
+                    [{
+                        "name": file_name,
+                        "res_model": "account.move",
+                        "res_id": bill_id,
+                        "type": "binary",
+                        "datas": file_b64,
+                        "mimetype": file_mime,
+                    }]
+                )
+                attachment_result = {"ok": True, "attachment_id": att_id, "filename": file_name}
+                log.info("Attachment created: %s (id=%s) on bill %s", file_name, att_id, bill_id)
+            except Exception as att_err:
+                log.warning("Attachment failed: %s", att_err)
+                attachment_result = {"ok": False, "error": str(att_err)}
+
+        # 2. Update standard_price for each mapped product
+        price_updates = []
+        for l in inv.get("lignes", []):
+            designation = l.get("designation", "")
+            price_ht = l.get("prix_unitaire_ht", 0)
+            if not price_ht or price_ht <= 0:
+                continue
+            # Find product via mapping
+            mapped_id, facteur, note = find_product_in_mapping(designation)
+            if mapped_id:
+                try:
+                    # Adjust price by facteur (if 1 carton = 12 KG, unit price = carton_price / 12)
+                    unit_price = price_ht / facteur if facteur and facteur != 1 else price_ht
+                    models.execute_kw(
+                        ODOO_DB, uid, ODOO_PASSWORD, "product.product", "write",
+                        [[int(mapped_id)], {"standard_price": round(unit_price, 4)}]
+                    )
+                    price_updates.append({
+                        "product_id": int(mapped_id),
+                        "designation": designation,
+                        "new_price": round(unit_price, 4)
+                    })
+                    log.info("Price updated: %s -> %.4f€", designation, unit_price)
+                except Exception as pe:
+                    log.warning("Price update failed for %s: %s", designation, pe)
+
+        log.info("Price updates: %d products", len(price_updates))
+
+        # 3. Create stock reception
         reception_result = create_stock_reception(models, uid, inv, lines)
         log.info("Reception result: %s", reception_result)
 
@@ -1783,6 +1857,8 @@ async def invoice_push(request: Request):
             "lines": len(lines),
             "unmatched": unmatched,
             "partner_found": bool(partner_id),
+            "attachment": attachment_result,
+            "price_updates": len(price_updates),
             "reception": reception_result
         }
 
