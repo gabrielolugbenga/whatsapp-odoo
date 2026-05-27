@@ -1324,7 +1324,7 @@ def create_sale_order(order_data: dict, phone: str, contact: str):
     if shipping_cost > 0:
         delivery_ids = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD, "product.product", "search",
-            [[["name", "ilike", "Livraison"], ["sale_ok", "=", True]]], {"limit": 1}
+            [[["product_tmpl_id", "=", 5516], ["active", "=", True]]], {"limit": 1}
         )
         if delivery_ids:
             lines.append((0, 0, {
