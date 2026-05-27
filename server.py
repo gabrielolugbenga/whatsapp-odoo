@@ -3821,7 +3821,7 @@ async def products_margins():
 async def catalog_feed():
     """Generate CSV product feed for Meta Commerce catalog"""
     try:
-        models = get_odoo_models()
+        models, uid = odoo_login()
         products = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD, 'product.template', 'search_read',
             [[['sale_ok', '=', True], ['active', '=', True]]],
