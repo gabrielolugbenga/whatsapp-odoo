@@ -44,7 +44,7 @@ VERIFY_TOKEN = os.environ["VERIFY_TOKEN"]
 ADMIN_PHONE  = os.environ.get("ADMIN_PHONE", "")
 
 # WhatsApp catalogue link — update with real link once catalogue is set up
-CATALOGUE_LINK = os.environ.get("CATALOGUE_LINK", "https://wa.me/c/971523231413")
+CATALOGUE_LINK = os.environ.get("CATALOGUE_LINK", "https://wa.me/c/33745987613")
 
 IDF_PREFIXES = ("75", "77", "78", "91", "92", "93", "94", "95")
 IDF_FREE_DELIVERY_THRESHOLD = 100.0
