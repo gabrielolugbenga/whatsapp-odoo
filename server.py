@@ -3838,7 +3838,7 @@ async def catalog_feed():
             title = p.get('name', '')
             description = p.get('description_sale') or title
             price = f"{float(p.get('list_price', 0)):.2f}"
-            image_url = f"{ODOO_URL}/web/image/product.template/{p['id']}/image_1920"
+            image_url = f"https://web-production-9581a.up.railway.app/product-image/{p['id']}"
 
             category = (p.get('categ_id') or [0, 'General'])[1]
             writer.writerow([product_id, title, description, price, 'EUR', image_url, 'Africomfort Foods', 'new', 'in stock', category])
@@ -3853,4 +3853,24 @@ async def catalog_feed():
 
     except Exception as e:
         log.error("catalog_feed error: %s", e)
+        return {"error": str(e)}
+
+@app.get("/product-image/{product_id}")
+async def product_image(product_id: int):
+    """Proxy public pour les images produits Odoo"""
+    import httpx
+    try:
+        url = f"{ODOO_URL}/web/image/product.template/{product_id}/image_1920"
+        async with httpx.AsyncClient() as client:
+            response = await client.get(url, timeout=10)
+            if response.status_code == 200:
+                from fastapi.responses import Response
+                return Response(
+                    content=response.content,
+                    media_type=response.headers.get("content-type", "image/jpeg")
+                )
+            else:
+                return {"error": "Image not found"}
+    except Exception as e:
+        log.error("product_image error: %s", e)
         return {"error": str(e)}
