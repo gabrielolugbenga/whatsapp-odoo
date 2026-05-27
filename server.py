@@ -3824,7 +3824,7 @@ async def catalog_feed():
         models, uid = odoo_login()
         products = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD, 'product.template', 'search_read',
-            [[['sale_ok', '=', True], ['active', '=', True]]],
+            [[['sale_ok', '=', True], ['active', '=', True], ['is_published', '=', True]]],
             {'fields': ['name', 'list_price', 'description_sale', 'categ_id', 'image_1920', 'default_code'], 'limit': 200}
         )
 
