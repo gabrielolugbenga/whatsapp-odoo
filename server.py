@@ -44,7 +44,7 @@ VERIFY_TOKEN = os.environ["VERIFY_TOKEN"]
 ADMIN_PHONE  = os.environ.get("ADMIN_PHONE", "")
 
 # WhatsApp catalogue link — update with real link once catalogue is set up
-CATALOGUE_LINK = os.environ.get("CATALOGUE_LINK", "https://wa.me/c/33745987613")
+CATALOGUE_LINK = os.environ.get("CATALOGUE_LINK", "https://wa.me/c/971523231413")
 
 IDF_PREFIXES = ("75", "77", "78", "91", "92", "93", "94", "95")
 IDF_FREE_DELIVERY_THRESHOLD = 100.0
@@ -1324,7 +1324,7 @@ def create_sale_order(order_data: dict, phone: str, contact: str):
     if shipping_cost > 0:
         delivery_ids = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD, "product.product", "search",
-            [[["product_tmpl_id", "=", 5516], ["active", "=", True]]], {"limit": 1}
+            [[["name", "ilike", "Livraison"], ["sale_ok", "=", True]]], {"limit": 1}
         )
         if delivery_ids:
             lines.append((0, 0, {
@@ -1534,6 +1534,9 @@ async function push(){
     const r=await fetch('/invoice/push',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(inv)});
     const d=await r.json();
     if(d.error)throw new Error(d.error);
+    if(d.po_name){
+      log(`✓ Bon de commande créé : ${d.po_name}`,'ok');
+    }
     log(`✓ Facture créée dans Odoo — ID: ${d.bill_id}`,'ok');
     log(`✓ ${inv.lignes.length} ligne(s) importée(s)`,'ok');
     if(d.attachment && d.attachment.ok){
@@ -1541,15 +1544,15 @@ async function push(){
     } else if(d.attachment && !d.attachment.ok){
       log(`⚠ PJ non attachée : ${d.attachment.error}`,'warn');
     }
-    if(d.price_updates > 0){
-      log(`✓ Prix d'achat mis à jour : ${d.price_updates} produit(s)`,'ok');
-    }
     if(d.reception && d.reception.reception_name){
-      log(`✓ Réception stock: ${d.reception.reception_name} [${d.reception.state}] — ${d.reception.lines} ligne(s)`,'ok');
+      log(`✓ Réception stock: ${d.reception.reception_name} [${d.reception.state}] — à valider dans Odoo`,'ok');
     } else if(d.reception && d.reception.error){
-      log(`⚠ Stock non mis à jour: ${d.reception.error}`,'warn');
+      log(`⚠ Stock: ${d.reception.error}`,'warn');
     }
-    status(`Facture ${inv.reference} → Odoo ✓ + PJ ✓ + Prix ✓ + Stock ✓`,'ok');
+    const statusMsg = d.po_name
+      ? `Facture ${inv.reference} → BdC ${d.po_name} ✓ + Réception ✓ + Facture ✓`
+      : `Facture ${inv.reference} → Odoo ✓ (mode direct)`;
+    status(statusMsg,'ok');
     $('bp').textContent='✓ Envoyé dans Odoo';
   }catch(e){log(`Erreur push : ${e.message}`,'err');status('Erreur envoi Odoo','err');$('bp').disabled=false}
 }
@@ -1779,27 +1782,149 @@ async def invoice_push(request: Request):
                     line_vals["tax_ids"] = [(6, 0, tax_ids)]
                 lines.append([0, 0, line_vals])
 
-        # Create vendor bill
-        bill_id = models.execute_kw(
-            ODOO_DB, uid, ODOO_PASSWORD, "account.move", "create", [{
-                "move_type": "in_invoice",
-                "partner_id": partner_id or False,
-                "ref": inv.get("reference", ""),
-                "invoice_date": inv.get("date") or False,
-                "invoice_date_due": inv.get("echeance") or False,
-                "invoice_line_ids": lines,
-            }]
-        )
-        log.info("Bill ID=%s — %d lines, %d unmatched", bill_id, len(lines), len(unmatched))
+        # ── Build PO lines (without tax — taxes on invoice only) ────────────
+        po_lines = []
+        for line_cmd in lines:
+            vals = line_cmd[2]
+            if not vals.get("product_id"):
+                continue
+            # Get product UOM
+            prod_info = models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD, "product.product", "read",
+                [[vals["product_id"]]], {"fields": ["uom_po_id", "uom_id"]}
+            )
+            # uom_po_id may not exist in Odoo 19
+            uom_id = False
+            if prod_info:
+                uom_po = prod_info[0].get("uom_po_id")
+                uom = prod_info[0].get("uom_id")
+                uom_id = (uom_po[0] if uom_po else None) or (uom[0] if uom else None)
+            po_lines.append((0, 0, {
+                "product_id": vals["product_id"],
+                "name": vals.get("name", ""),
+                "product_qty": vals.get("quantity", 1),
+                "price_unit": vals.get("price_unit", 0),
+                "product_uom": uom_id,
+                "date_planned": inv.get("date") or False,
+            }))
 
-        # 1. Attach original invoice file to the bill
+        # ── Step 1: Create Purchase Order ─────────────────────────────────────
+        po_id = None
+        po_name = None
+        bill_id = None
+        reception_result = None
         attachment_result = None
-        if _last_uploaded_file.get("b64"):
+
+        try:
+            if po_lines:
+                po_id = models.execute_kw(
+                    ODOO_DB, uid, ODOO_PASSWORD, "purchase.order", "create", [{
+                        "partner_id": partner_id or False,
+                        "partner_ref": inv.get("reference", ""),
+                        "date_order": inv.get("date") or False,
+                        "order_line": po_lines,
+                        "notes": f"Créé automatiquement depuis facture {inv.get('reference','')}",
+                    }]
+                )
+                # Confirm PO (makes it "Bon de commande")
+                models.execute_kw(
+                    ODOO_DB, uid, ODOO_PASSWORD, "purchase.order", "button_confirm",
+                    [[po_id]]
+                )
+                po_info = models.execute_kw(
+                    ODOO_DB, uid, ODOO_PASSWORD, "purchase.order", "read",
+                    [[po_id]], {"fields": ["name", "state"]}
+                )[0]
+                po_name = po_info["name"]
+                log.info("PO created: %s (id=%s)", po_name, po_id)
+
+                # ── Step 2: Get reception created by PO ───────────────────────
+                picking_ids = models.execute_kw(
+                    ODOO_DB, uid, ODOO_PASSWORD, "stock.picking", "search",
+                    [[["purchase_id", "=", po_id]]], {"limit": 1}
+                )
+                if picking_ids:
+                    picking_id = picking_ids[0]
+                    picking_info = models.execute_kw(
+                        ODOO_DB, uid, ODOO_PASSWORD, "stock.picking", "read",
+                        [[picking_id]], {"fields": ["name", "state"]}
+                    )[0]
+                    reception_result = {
+                        "reception_id": picking_id,
+                        "reception_name": picking_info["name"],
+                        "state": picking_info["state"],
+                        "lines": len(po_lines),
+                        "note": "Lié au BdC — valider dans Inventaire"
+                    }
+                    log.info("Reception from PO: %s [%s]", picking_info["name"], picking_info["state"])
+
+                # ── Step 3: Create vendor bill linked to PO ───────────────────
+                # Odoo creates a draft bill from PO
+                bill_result = models.execute_kw(
+                    ODOO_DB, uid, ODOO_PASSWORD, "purchase.order", "action_create_invoice",
+                    [[po_id]]
+                )
+                # Find the created invoice
+                inv_ids = models.execute_kw(
+                    ODOO_DB, uid, ODOO_PASSWORD, "account.move", "search",
+                    [[["purchase_id", "=", po_id], ["move_type", "=", "in_invoice"]]],
+                    {"limit": 1}
+                )
+                if inv_ids:
+                    bill_id = inv_ids[0]
+                    # Update bill with invoice ref and date
+                    models.execute_kw(
+                        ODOO_DB, uid, ODOO_PASSWORD, "account.move", "write",
+                        [[bill_id], {
+                            "ref": inv.get("reference", ""),
+                            "invoice_date": inv.get("date") or False,
+                            "invoice_date_due": inv.get("echeance") or False,
+                        }]
+                    )
+                    # Add unmatched lines to the bill
+                    for l in inv.get("lignes", []):
+                        designation = l.get("designation", "")
+                        if designation in unmatched:
+                            tva_pct = l.get("tva_pct", 0)
+                            tax_ids = get_tax_ids_for_line(tva_pct)
+                            extra_line = {
+                                "move_id": bill_id,
+                                "name": f"[A LIER] {designation}",
+                                "quantity": l.get("quantite", 1),
+                                "price_unit": l.get("prix_unitaire_ht", 0),
+                            }
+                            if tax_ids:
+                                extra_line["tax_ids"] = [(6, 0, tax_ids)]
+                            models.execute_kw(
+                                ODOO_DB, uid, ODOO_PASSWORD, "account.move.line", "create",
+                                [extra_line]
+                            )
+                    log.info("Bill linked to PO: id=%s", bill_id)
+
+        except Exception as po_err:
+            log.warning("PO workflow failed (%s) — falling back to direct bill", po_err)
+            # ── FALLBACK: create bill directly (old behaviour) ────────────────
+            bill_id = models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD, "account.move", "create", [{
+                    "move_type": "in_invoice",
+                    "partner_id": partner_id or False,
+                    "ref": inv.get("reference", ""),
+                    "invoice_date": inv.get("date") or False,
+                    "invoice_date_due": inv.get("echeance") or False,
+                    "invoice_line_ids": lines,
+                }]
+            )
+            reception_result = create_stock_reception(models, uid, inv, lines)
+            log.info("Fallback bill created: id=%s", bill_id)
+
+        log.info("Bill ID=%s PO=%s — %d lines, %d unmatched", bill_id, po_name, len(lines), len(unmatched))
+
+        # ── Attach original invoice file ──────────────────────────────────────
+        if bill_id and _last_uploaded_file.get("b64"):
             try:
                 file_b64 = _last_uploaded_file["b64"]
                 file_mime = _last_uploaded_file.get("mime", "image/jpeg")
                 file_name = _last_uploaded_file.get("filename", "facture")
-                # Add extension if missing
                 if "." not in file_name:
                     ext = "pdf" if "pdf" in file_mime else "jpg"
                     file_name = f"{file_name}.{ext}"
@@ -1815,50 +1940,18 @@ async def invoice_push(request: Request):
                     }]
                 )
                 attachment_result = {"ok": True, "attachment_id": att_id, "filename": file_name}
-                log.info("Attachment created: %s (id=%s) on bill %s", file_name, att_id, bill_id)
+                log.info("Attachment created: %s on bill %s", file_name, bill_id)
             except Exception as att_err:
                 log.warning("Attachment failed: %s", att_err)
                 attachment_result = {"ok": False, "error": str(att_err)}
 
-        # 2. Update standard_price for each mapped product
-        price_updates = []
-        for l in inv.get("lignes", []):
-            designation = l.get("designation", "")
-            price_ht = l.get("prix_unitaire_ht", 0)
-            if not price_ht or price_ht <= 0:
-                continue
-            # Find product via mapping
-            mapped_id, facteur, note = find_product_in_mapping(designation)
-            if mapped_id:
-                try:
-                    # Adjust price by facteur (if 1 carton = 12 KG, unit price = carton_price / 12)
-                    unit_price = price_ht / facteur if facteur and facteur != 1 else price_ht
-                    models.execute_kw(
-                        ODOO_DB, uid, ODOO_PASSWORD, "product.product", "write",
-                        [[int(mapped_id)], {"standard_price": round(unit_price, 4)}]
-                    )
-                    price_updates.append({
-                        "product_id": int(mapped_id),
-                        "designation": designation,
-                        "new_price": round(unit_price, 4)
-                    })
-                    log.info("Price updated: %s -> %.4f€", designation, unit_price)
-                except Exception as pe:
-                    log.warning("Price update failed for %s: %s", designation, pe)
-
-        log.info("Price updates: %d products", len(price_updates))
-
-        # 3. Create stock reception
-        reception_result = create_stock_reception(models, uid, inv, lines)
-        log.info("Reception result: %s", reception_result)
-
         return {
             "bill_id": bill_id,
+            "po_name": po_name,
             "lines": len(lines),
             "unmatched": unmatched,
             "partner_found": bool(partner_id),
             "attachment": attachment_result,
-            "price_updates": len(price_updates),
             "reception": reception_result
         }
 
@@ -3815,69 +3908,4 @@ async def products_margins():
         log.error("products_margins error: %s", e)
         import traceback
         log.error(traceback.format_exc())
-        return {"error": str(e)}
-
-@app.get("/catalog-feed")
-async def catalog_feed():
-    """Generate CSV product feed for Meta Commerce catalog"""
-    try:
-        models, uid = odoo_login()
-        products = models.execute_kw(
-            ODOO_DB, uid, ODOO_PASSWORD, 'product.template', 'search_read',
-            [[['sale_ok', '=', True], ['active', '=', True], ['is_published', '=', True]]],
-            {'fields': ['name', 'list_price', 'description_sale', 'categ_id', 'image_1920', 'default_code'], 'limit': 200}
-        )
-
-        import csv, io
-        output = io.StringIO()
-        writer = csv.writer(output)
-        writer.writerow(['id', 'title', 'description', 'price', 'currency', 'image_url', 'brand', 'condition', 'availability', 'google_product_category'])
-
-        for p in products:
-            product_id = p.get('default_code') or str(p['id'])
-            title = p.get('name', '')
-            description = p.get('description_sale') or title
-            price = f"{float(p.get('list_price', 0)):.2f}"
-            image_url = f"https://web-production-9581a.up.railway.app/product-image/{p['id']}"
-
-            category = (p.get('categ_id') or [0, 'General'])[1]
-            writer.writerow([product_id, title, description, price, 'EUR', image_url, 'Africomfort Foods', 'new', 'in stock', category])
-
-        output.seek(0)
-        from fastapi.responses import StreamingResponse
-        return StreamingResponse(
-            iter([output.getvalue()]),
-            media_type="text/csv",
-            headers={"Content-Disposition": "attachment; filename=catalog.csv"}
-        )
-
-    except Exception as e:
-        log.error("catalog_feed error: %s", e)
-        return {"error": str(e)}
-
-@app.get("/product-image/{product_id}")
-async def product_image(product_id: int):
-    """Proxy public pour les images produits Odoo - convertit en JPEG"""
-    import httpx
-    from fastapi.responses import Response
-    from PIL import Image
-    import io
-    try:
-        url = f"{ODOO_URL}/web/image/product.template/{product_id}/image_1920"
-        async with httpx.AsyncClient() as client:
-            response = await client.get(url, timeout=10)
-            if response.status_code == 200:
-                img = Image.open(io.BytesIO(response.content)).convert("RGB")
-                buf = io.BytesIO()
-                img.save(buf, format="JPEG", quality=85)
-                buf.seek(0)
-                return Response(
-                    content=buf.getvalue(),
-                    media_type="image/jpeg",
-                    headers={"Cache-Control": "public, max-age=86400"}
-                )
-            else:
-                return {"error": "Image not found"}
-    except Exception as e:
-        log.error("product_image error: %s", e)
         return {"error": str(e)}
