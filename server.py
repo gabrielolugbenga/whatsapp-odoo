@@ -1791,14 +1791,11 @@ async def invoice_push(request: Request):
             # Get product UOM
             prod_info = models.execute_kw(
                 ODOO_DB, uid, ODOO_PASSWORD, "product.product", "read",
-                [[vals["product_id"]]], {"fields": ["uom_po_id", "uom_id"]}
+                [[vals["product_id"]]], {"fields": ["uom_id"]}
             )
-            # uom_po_id may not exist in Odoo 19
             uom_id = False
-            if prod_info:
-                uom_po = prod_info[0].get("uom_po_id")
-                uom = prod_info[0].get("uom_id")
-                uom_id = (uom_po[0] if uom_po else None) or (uom[0] if uom else None)
+            if prod_info and prod_info[0].get("uom_id"):
+                uom_id = prod_info[0]["uom_id"][0]
             po_lines.append((0, 0, {
                 "product_id": vals["product_id"],
                 "name": vals.get("name", ""),
