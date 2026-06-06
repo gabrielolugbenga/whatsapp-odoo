@@ -3920,6 +3920,13 @@ async def product_image(product_id: int):
             response = await client.get(url, timeout=10)
             if response.status_code == 200:
                 img = Image.open(io.BytesIO(response.content)).convert("RGB")
+                # Crop to square (1:1) for Meta catalog
+                w, h = img.size
+                size = min(w, h)
+                left = (w - size) // 2
+                top = (h - size) // 2
+                img = img.crop((left, top, left + size, top + size))
+                img = img.resize((800, 800), Image.LANCZOS)
                 buf = io.BytesIO()
                 img.save(buf, format="JPEG", quality=85)
                 buf.seek(0)
