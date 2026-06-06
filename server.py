@@ -3940,3 +3940,69 @@ async def product_image(product_id: int):
     except Exception as e:
         log.error("product_image error: %s", e)
         return {"error": str(e)}
+
+@app.get("/catalog-feed")
+async def catalog_feed():
+    """Generate CSV product feed for Meta Commerce catalog"""
+    try:
+        models, uid = odoo_login()
+        products = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD, 'product.template', 'search_read',
+            [[['sale_ok', '=', True], ['active', '=', True], ['is_published', '=', True]]],
+            {'fields': ['name', 'list_price', 'description_sale', 'categ_id', 'default_code'], 'limit': 200}
+        )
+        import csv, io
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(['id', 'title', 'description', 'price', 'currency', 'image_url', 'brand', 'condition', 'availability', 'google_product_category'])
+        for p in products:
+            product_id = p.get('default_code') or str(p['id'])
+            title = p.get('name', '')
+            description = p.get('description_sale') or title
+            price = f"{float(p.get('list_price', 0)):.2f}"
+            image_url = f"https://web-production-9581a.up.railway.app/product-image/{p['id']}"
+            category = (p.get('categ_id') or [0, 'General'])[1]
+            writer.writerow([product_id, title, description, price, 'EUR', image_url, 'Africomfort Foods', 'new', 'in stock', category])
+        output.seek(0)
+        from fastapi.responses import StreamingResponse
+        return StreamingResponse(
+            iter([output.getvalue()]),
+            media_type="text/csv",
+            headers={"Content-Disposition": "attachment; filename=catalog.csv"}
+        )
+    except Exception as e:
+        log.error("catalog_feed error: %s", e)
+        return {"error": str(e)}
+
+@app.get("/product-image/{product_id}")
+async def product_image(product_id: int):
+    """Proxy public pour les images produits Odoo - convertit en JPEG carré"""
+    import httpx
+    from fastapi.responses import Response
+    from PIL import Image
+    import io
+    try:
+        url = f"{ODOO_URL}/web/image/product.template/{product_id}/image_1920"
+        async with httpx.AsyncClient() as client:
+            response = await client.get(url, timeout=10)
+            if response.status_code == 200:
+                img = Image.open(io.BytesIO(response.content)).convert("RGB")
+                w, h = img.size
+                size = min(w, h)
+                left = (w - size) // 2
+                top = (h - size) // 2
+                img = img.crop((left, top, left + size, top + size))
+                img = img.resize((800, 800), Image.LANCZOS)
+                buf = io.BytesIO()
+                img.save(buf, format="JPEG", quality=85)
+                buf.seek(0)
+                return Response(
+                    content=buf.getvalue(),
+                    media_type="image/jpeg",
+                    headers={"Cache-Control": "public, max-age=3600"}
+                )
+            else:
+                return {"error": "Image not found"}
+    except Exception as e:
+        log.error("product_image error: %s", e)
+        return {"error": str(e)}
