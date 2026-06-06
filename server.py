@@ -3960,7 +3960,7 @@ async def catalog_feed():
             title = p.get('name', '')
             description = p.get('description_sale') or title
             price = f"{float(p.get('list_price', 0)):.2f}"
-            image_url = f"https://web-production-9581a.up.railway.app/product-image/{p['id']}"
+            image_url = f"https://web-production-9581a.up.railway.app/product-image/{p['id']}?v=3"
             category = (p.get('categ_id') or [0, 'General'])[1]
             writer.writerow([product_id, title, description, price, 'EUR', image_url, 'Africomfort Foods', 'new', 'in stock', category])
         output.seek(0)
