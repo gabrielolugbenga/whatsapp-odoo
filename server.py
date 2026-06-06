@@ -3954,7 +3954,7 @@ async def catalog_feed():
         import csv, io
         output = io.StringIO()
         writer = csv.writer(output)
-        writer.writerow(['id', 'title', 'description', 'price', 'currency', 'image_url', 'brand', 'condition', 'availability', 'google_product_category'])
+        writer.writerow(['id', 'title', 'description', 'price', 'currency', 'image_url', 'brand', 'condition', 'availability', 'google_product_category', 'link'])
         for p in products:
             product_id = p.get('default_code') or str(p['id'])
             title = p.get('name', '')
@@ -3962,7 +3962,8 @@ async def catalog_feed():
             price = f"{float(p.get('list_price', 0)):.2f}"
             image_url = f"https://web-production-9581a.up.railway.app/product-image/{p['id']}?v=3"
             category = (p.get('categ_id') or [0, 'General'])[1]
-            writer.writerow([product_id, title, description, price, 'EUR', image_url, 'Africomfort Foods', 'new', 'in stock', category])
+            product_link = f"{ODOO_URL}/shop/product/{p['id']}"
+            writer.writerow([product_id, title, description, price, 'EUR', image_url, 'Africomfort Foods', 'new', 'in stock', category, product_link])
         output.seek(0)
         from fastapi.responses import StreamingResponse
         return StreamingResponse(
