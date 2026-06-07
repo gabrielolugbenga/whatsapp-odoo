@@ -567,7 +567,7 @@ async def finalize_client_order(phone: str, contact: str):
                 f"🚚 Delivery fee: {order_data['shipping_cost']:.2f}€\n"
                 f"💰 *Total: {grand_total:.2f}€*\n\n"
                 "How would you like to pay?\n"
-                "1️⃣ Cash on delivery\n"
+                "1️⃣ Payment on delivery\n"
                 "2️⃣ Online payment (Mollie link)\n\n"
                 "Reply with 1 or 2."
             )
@@ -731,17 +731,17 @@ async def handle_payment_response(phone: str, text: str):
         # IDF + 77 : livraison ou Mollie
         if choice == "1":
             await send_whatsapp(phone,
-                f"✅ *Cash on delivery* confirmed for {order_name}.\n"
+                f"✅ *Payment on delivery* confirmed for {order_name}.\n"
                 f"Total: {total:.2f}€\n\nThank you! 🙏"
             )
             await send_whatsapp(ADMIN_PHONE,
-                f"💵 {order_name} — *Cash on delivery* — {total:.2f}€\n📍 {address}"
+                f"💵 {order_name} — *Payment on delivery* — {total:.2f}€\n📍 {address}"
             )
         elif choice == "2":
             await send_mollie()
         else:
             await send_whatsapp(phone,
-                "Please reply:\n1️⃣ Cash on delivery\n2️⃣ Online payment (Mollie link)"
+                "Please reply:\n1️⃣ Payment on delivery\n2️⃣ Online payment (Mollie link)"
             )
             waiting_for_payment[phone] = pending
     else:
@@ -1092,7 +1092,7 @@ async def handle_admin_validation(decision: str):
                 f"🚚 Delivery: €{order_data.get('shipping_cost', 0):.2f}\n"
                 f"💳 *Total: €{grand_total:.2f}*\n\n"
                 "How would you like to pay?\n"
-                "1️⃣ Card on delivery\n2️⃣ Cash on delivery\n3️⃣ Payment link\n\nReply 1, 2 or 3."
+                "1️⃣ Card on delivery\n2️⃣ Payment on delivery\n3️⃣ Payment link\n\nReply 1, 2 or 3."
             )
         except Exception as e:
             await send_whatsapp(ADMIN_PHONE, f"❌ Odoo error: {str(e)}")
