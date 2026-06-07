@@ -539,15 +539,6 @@ async def finalize_client_order(phone: str, contact: str):
         is_77    = dept == "77"
 
         delivery_name = session.get("delivery_name", contact)
-        await send_whatsapp(ADMIN_PHONE,
-            f"✅ *New order — {order_name}*\n"
-            f"Customer: {contact} ({phone})\n"
-            f"👤 Delivery name: {delivery_name}\n"
-            f"📍 Address: {address or 'Not provided'}\n\n"
-            f"{items_txt}\n\n"
-            f"🚚 Delivery: {order_data['shipping_cost']:.2f}€\n"
-            f"💰 Total: {grand_total:.2f}€"
-        )
 
         # Options paiement selon zone
         waiting_for_payment[phone] = {
