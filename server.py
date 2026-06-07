@@ -45,7 +45,7 @@ ADMIN_PHONE  = os.environ.get("ADMIN_PHONE", "")
 LIVE_PHONE   = os.environ.get("LIVE_PHONE", "33660565129")  # Numéro support humain
 
 # WhatsApp catalogue link
-CATALOGUE_LINK = os.environ.get("CATALOGUE_LINK", "https://wa.me/c/971523231413")
+CATALOGUE_LINK = os.environ.get("CATALOGUE_LINK", "https://wa.me/c/33745987613")
 
 IDF_PREFIXES = ("75", "77", "78", "91", "92", "93", "94", "95")
 IDF_FREE_DELIVERY_THRESHOLD = 100.0
@@ -211,18 +211,7 @@ async def handle_new_client_message(phone: str, contact: str, text: str):
 
     if result.get("type") != "order" or not result.get("items"):
         # Not an order — show catalogue + friendly message
-        if True:
-            await send_whatsapp(phone,
-                f"Hi {contact}! 👋 Welcome to Africomfort Foods!\n\n"
-                f"🛒 *Order easily via our catalogue:*\n{CATALOGUE_LINK}\n\n"
-                "Browse our products, add to cart and send your order directly!\n\n"
-                "Or simply type your order below and we'll take care of the rest. 😊\n\n"
-                "For questions, contact us on +33 6 60 56 51 29."
-            )
-        else:
-            await send_whatsapp(ADMIN_PHONE,
-                f"💬 Message from {contact} ({phone}):\n\n{text}\n\nPlease reply directly on WhatsApp."
-            )
+        return  # Bienvenue deja envoye
             await send_whatsapp(phone,
                 "Thank you for your message! Our team will get back to you shortly. 😊\n\n"
                 f"🛒 In the meantime, browse our catalogue: {CATALOGUE_LINK}"
