@@ -212,11 +212,6 @@ async def handle_new_client_message(phone: str, contact: str, text: str):
     if result.get("type") != "order" or not result.get("items"):
         # Not an order — show catalogue + friendly message
         return  # Bienvenue deja envoye
-            await send_whatsapp(phone,
-                "Thank you for your message! Our team will get back to you shortly. 😊\n\n"
-                f"🛒 In the meantime, browse our catalogue: {CATALOGUE_LINK}"
-            )
-        return
 
     # It's an order — start session
     await start_order_session(phone, contact, result)
