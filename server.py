@@ -185,8 +185,6 @@ async def receive_message(request: Request):
 
 async def handle_new_client_message(phone: str, contact: str, text: str):
     """First message or no active session — always show welcome."""
-    seen_customers.add(phone)
-
     if phone in seen_customers:
         return
     seen_customers.add(phone)
