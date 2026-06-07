@@ -253,20 +253,7 @@ async def handle_client_session(phone: str, contact: str, text: str):
 
     elif step == "address":
         session["address"] = text.strip()
-        idf          = session.get("idf", False)
-        total_amount = session.get("total_amount", 0)
-        total_weight = session.get("total_weight", 0)
-        postcode     = session.get("postal_code", "")
-        shipping_cost, shipping_note = calculate_shipping(idf, total_amount, total_weight, postcode)
-        session["shipping_cost"] = shipping_cost
-        session["grand_total"]   = total_amount + shipping_cost
-        session["step"]          = "confirm"
-        await send_whatsapp(phone,
-            f"📍 Adresse enregistrée : *{text.strip()}*\n\n"
-            f"🚚 {shipping_note}\n"
-            f"💳 *Total : {session['grand_total']:.2f}€*\n\n"
-            "Répondez *CONFIRMER* pour valider votre commande."
-        )
+        await show_order_recap(phone, contact)
         return
 
     elif step == "idf":
@@ -275,7 +262,7 @@ async def handle_client_session(phone: str, contact: str, text: str):
     elif step == "confirm":
         if txt_up in ("CONFIRMER", "CONFIRM", "YES", "OUI", "OK", "✓", "✅"):
             await finalize_client_order(phone, contact)
-        elif txt_up in ("CANCEL", "NON", "NO"):
+        elif txt_up in ("CANCEL", "NON", "NO", "CANCELLED"):
             client_sessions.pop(phone, None)
             await send_whatsapp(phone,
                 "Order cancelled. Feel free to start a new order anytime! 😊\n\n"
@@ -441,51 +428,45 @@ async def handle_client_idf(phone: str, contact: str, text: str):
     session = client_sessions.get(phone)
     postal  = re.sub(r"[^\d]", "", text)[:5]
     idf     = postal[:2] in IDF_PREFIXES if len(postal) >= 2 else False
-    session["idf"]       = idf
-    session["idf_known"] = True
-    session["postal"]    = postal
+    session["idf"]        = idf
+    session["idf_known"]  = True
+    session["postal_code"] = postal
     save_customer_idf(phone, idf)
-    await show_order_recap(phone, contact)
+    # Ask address next
+    session["step"] = "address"
+    await send_whatsapp(phone, "What is your full delivery address?\n_(Street number, street, postcode, city)_")
 
 
 async def show_order_recap(phone: str, contact: str):
-    """Show order summary and ask client to confirm."""
+    """Show full order summary after address is known."""
     session      = client_sessions.get(phone)
     resolved     = session.get("resolved_items", [])
     unresolved   = session.get("unresolved", [])
     total_amount = session.get("total_amount", 0)
     total_weight = session.get("total_weight", 0)
     idf          = session.get("idf", False)
+    postal_code  = session.get("postal_code", "")
+    address      = session.get("address", "")
 
-    shipping_cost, shipping_note = calculate_shipping(idf, total_amount, total_weight)
+    shipping_cost, shipping_note = calculate_shipping(idf, total_amount, total_weight, postal_code)
     grand_total = total_amount + shipping_cost
     session["shipping_cost"] = shipping_cost
     session["grand_total"]   = grand_total
     session["step"]          = "confirm"
 
-    lines = "\n".join(
-        f"  • {it['product_name']} × {it['quantity']} — €{it['line_total']:.2f}"
-        for it in resolved
-    )
-
-    msg = f"🛒 *Récapitulatif de votre commande :*\n\n{lines}"
-
-    if unresolved:
-        msg += "\n\n⚠️ *Produits non trouvés — notre équipe vous contactera :*\n"
-        msg += "\n".join(f"  • {u['product_name']} × {u['quantity']}" for u in unresolved)
-
-    msg += f"\n\n🚚 {shipping_note}"
-    msg += f"\n💳 *Total : {grand_total:.2f}€*\n\n"
-
-    # Demander l'adresse si pas encore renseignée
-    address = session.get("address", "")
-    if not address:
-        session["step"] = "address"
-        msg += "📍 *Quelle est votre adresse de livraison complète ?*\n"
-        msg += "_(Numéro, rue, code postal, ville)_"
+    if resolved:
+        lines = "\n".join(
+            f"  • {it['product_name']} x{it['quantity']} — {it['line_total']:.2f}€"
+            for it in resolved
+        )
     else:
-        msg += f"📍 Livraison à : *{address}*\n\n"
-        msg += "Répondez *CONFIRMER* pour valider votre commande."
+        lines = "  (no products found)"
+
+    msg  = f"🛒 *Order summary:*\n\n{lines}\n\n"
+    msg += f"📍 Delivery: {address}\n"
+    msg += f"🚚 {shipping_note}\n"
+    msg += f"💰 *Total: {grand_total:.2f}€*\n\n"
+    msg += "Reply *OK* to confirm or *CANCEL* to cancel."
 
     await send_whatsapp(phone, msg)
 
