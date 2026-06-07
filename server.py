@@ -42,16 +42,18 @@ WA_TOKEN     = os.environ["WHATSAPP_TOKEN"]
 WA_PHONE_ID  = os.environ["WHATSAPP_PHONE_ID"]
 VERIFY_TOKEN = os.environ["VERIFY_TOKEN"]
 ADMIN_PHONE  = os.environ.get("ADMIN_PHONE", "")
+LIVE_PHONE   = os.environ.get("LIVE_PHONE", "33660565129")  # Numéro support humain
 
-# WhatsApp catalogue link — update with real link once catalogue is set up
+# WhatsApp catalogue link
 CATALOGUE_LINK = os.environ.get("CATALOGUE_LINK", "https://wa.me/c/971523231413")
 
 IDF_PREFIXES = ("75", "77", "78", "91", "92", "93", "94", "95")
 IDF_FREE_DELIVERY_THRESHOLD = 100.0
-IDF_DELIVERY_FEE = 3.0
-GLS_BASE = 9.0
-GLS_PER_KG = 0.65
-GLS_MAX_WEIGHT = 30.0
+IDF_DELIVERY_FEE    = 3.0   # IDF hors 77
+DEPT77_DELIVERY_FEE = 10.0  # Seine-et-Marne
+GLS_BASE            = 9.0
+GLS_PER_KG          = 0.65
+GLS_MAX_WEIGHT      = 30.0
 
 log.info("=== SERVER START === ADMIN: %s", ADMIN_PHONE)
 
@@ -182,21 +184,27 @@ async def receive_message(request: Request):
 # ── New client message ─────────────────────────────────────────────────────────
 
 async def handle_new_client_message(phone: str, contact: str, text: str):
-    """First message or no active session."""
-    first_time = phone not in seen_customers
+    """First message or no active session — always show welcome."""
     seen_customers.add(phone)
 
-    # Analyze message
+    await send_whatsapp(phone,
+        f"Bonjour {contact} 👋\n\n"
+        "Je suis le bot de commande *Africomfort Foods* 🤖\n\n"
+        "📦 *Pour passer commande :*\n"
+        f"Parcourez notre catalogue et sélectionnez vos produits :\n"
+        f"🛒 {CATALOGUE_LINK}\n\n"
+        "✅ Une fois votre sélection faite, je vous demanderai votre adresse "
+        "et le mode de paiement avant de confirmer.\n\n"
+        "📞 *Besoin de parler à quelqu\'un ?*\n"
+        "Appelez-nous au *0660 56 51 29*\n\n"
+        "_Ce numéro est géré par un robot — les messages texte ne sont pas traités par un humain._"
+    )
+
+    # Analyze message (commandes texte éventuelles)
     try:
         result = analyze_message(text)
     except Exception as e:
         log.error("Analysis error: %s", e)
-        await send_whatsapp(phone,
-            f"Hi {contact}! 👋\n\n"
-            f"The easiest way to order is through our catalogue:\n"
-            f"🛒 {CATALOGUE_LINK}\n\n"
-            "Or type your order and we'll help you out!"
-        )
         return
 
     if result.get("type") != "order" or not result.get("items"):
@@ -257,11 +265,29 @@ async def handle_client_session(phone: str, contact: str, text: str):
     if step == "clarification":
         await handle_client_clarification(phone, contact, text)
 
+    elif step == "address":
+        session["address"] = text.strip()
+        idf          = session.get("idf", False)
+        total_amount = session.get("total_amount", 0)
+        total_weight = session.get("total_weight", 0)
+        postcode     = session.get("postal_code", "")
+        shipping_cost, shipping_note = calculate_shipping(idf, total_amount, total_weight, postcode)
+        session["shipping_cost"] = shipping_cost
+        session["grand_total"]   = total_amount + shipping_cost
+        session["step"]          = "confirm"
+        await send_whatsapp(phone,
+            f"📍 Adresse enregistrée : *{text.strip()}*\n\n"
+            f"🚚 {shipping_note}\n"
+            f"💳 *Total : {session['grand_total']:.2f}€*\n\n"
+            "Répondez *CONFIRMER* pour valider votre commande."
+        )
+        return
+
     elif step == "idf":
         await handle_client_idf(phone, contact, text)
 
     elif step == "confirm":
-        if txt_up in ("CONFIRM", "YES", "OUI", "OK", "✓", "✅"):
+        if txt_up in ("CONFIRMER", "CONFIRM", "YES", "OUI", "OK", "✓", "✅"):
             await finalize_client_order(phone, contact)
         elif txt_up in ("CANCEL", "NON", "NO"):
             client_sessions.pop(phone, None)
@@ -456,15 +482,24 @@ async def show_order_recap(phone: str, contact: str):
         for it in resolved
     )
 
-    msg = f"🛒 *Your order summary:*\n\n{lines}"
+    msg = f"🛒 *Récapitulatif de votre commande :*\n\n{lines}"
 
     if unresolved:
-        msg += "\n\n⚠️ *Not found — our team will contact you:*\n"
+        msg += "\n\n⚠️ *Produits non trouvés — notre équipe vous contactera :*\n"
         msg += "\n".join(f"  • {u['product_name']} × {u['quantity']}" for u in unresolved)
 
     msg += f"\n\n🚚 {shipping_note}"
-    msg += f"\n💳 *Total: €{grand_total:.2f}*\n\n"
-    msg += "Reply *CONFIRM* to place your order, or tell me what you'd like to change."
+    msg += f"\n💳 *Total : {grand_total:.2f}€*\n\n"
+
+    # Demander l'adresse si pas encore renseignée
+    address = session.get("address", "")
+    if not address:
+        session["step"] = "address"
+        msg += "📍 *Quelle est votre adresse de livraison complète ?*\n"
+        msg += "_(Numéro, rue, code postal, ville)_"
+    else:
+        msg += f"📍 Livraison à : *{address}*\n\n"
+        msg += "Répondez *CONFIRMER* pour valider votre commande."
 
     await send_whatsapp(phone, msg)
 
@@ -510,20 +545,45 @@ async def finalize_client_order(phone: str, contact: str):
             f"💳 Total: €{grand_total:.2f}"
         )
 
-        # Ask client for payment
+        # Récupérer adresse et zone
+        address  = session.get("address", "")
+        idf_flag = order_data.get("idf", False)
+        postcode = session.get("postal_code", "")
+        dept     = (postcode or "")[:2]
+        is_77    = dept == "77"
+
+        # Notifier l'admin avec adresse
+        await send_whatsapp(ADMIN_PHONE,
+            f"✅ *Nouvelle commande — {order_name}*\n"
+            f"Client : {contact} ({phone})\n"
+            f"📍 Adresse : {address or 'Non renseignée'}\n\n"
+            f"{items_txt}\n\n"
+            f"🚚 Livraison : {order_data['shipping_cost']:.2f}€\n"
+            f"💳 Total : {grand_total:.2f}€"
+        )
+
+        # Options paiement selon zone
         waiting_for_payment[phone] = {
-            "order_name": order_name, "total": grand_total, "order_data": order_data
+            "order_name":  order_name,
+            "total":       grand_total,
+            "order_data":  order_data,
+            "idf":         idf_flag,
+            "postal_code": postcode,
+            "address":     address,
         }
 
+        if idf_flag or is_77:
+            payment_options = "1️⃣ Paiement à la livraison\n2️⃣ Paiement en ligne (lien Mollie)"
+        else:
+            payment_options = "1️⃣ Paiement en ligne (lien Mollie)"
+
         await send_whatsapp(phone,
-            f"✅ *Order confirmed — {order_name}*\n\n{items_txt}\n\n"
-            f"🚚 Delivery: €{order_data['shipping_cost']:.2f}\n"
-            f"💳 *Total: €{grand_total:.2f}*\n\n"
-            "How would you like to pay?\n"
-            "1️⃣ Card on delivery\n"
-            "2️⃣ Cash on delivery\n"
-            "3️⃣ Payment link (pay now)\n\n"
-            "Reply with 1, 2 or 3."
+            f"✅ *Commande confirmée — {order_name}*\n\n{items_txt}\n\n"
+            f"📍 Livraison : {address}\n"
+            f"🚚 Frais de livraison : {order_data['shipping_cost']:.2f}€\n"
+            f"💳 *Total : {grand_total:.2f}€*\n\n"
+            f"Comment souhaitez-vous payer ?\n{payment_options}\n\n"
+            "Répondez avec le numéro correspondant."
         )
 
     except Exception as e:
@@ -614,20 +674,20 @@ def client_clarification_msg(amb: dict) -> str:
     )
 
 
-def calculate_shipping(idf: bool, total_amount: float, total_weight: float) -> tuple:
+def calculate_shipping(idf: bool, total_amount: float, total_weight: float, postal_code: str = "") -> tuple:
+    """
+    Frais de livraison :
+    - Dept 77 (Seine-et-Marne) : 10€ fixe
+    - IDF hors 77              : 3€ fixe
+    - Autres départements      : 9€ + 0,65€/kg
+    """
+    dept = (postal_code or "")[:2]
+    if dept == "77":
+        return DEPT77_DELIVERY_FEE, f"Livraison Seine-et-Marne (77) : {DEPT77_DELIVERY_FEE:.2f}€"
     if idf:
-        if total_amount >= IDF_FREE_DELIVERY_THRESHOLD:
-            return IDF_DELIVERY_FEE, f"IDF delivery: €{IDF_DELIVERY_FEE:.2f}"
-        else:
-            needed   = IDF_FREE_DELIVERY_THRESHOLD - total_amount
-            shipping = GLS_BASE + GLS_PER_KG * total_weight
-            return shipping, (
-                f"💡 Add €{needed:.2f} more for free IDF delivery!\n"
-                f"Delivery fee: €{shipping:.2f}"
-            )
-    else:
-        shipping = GLS_BASE + GLS_PER_KG * min(total_weight, GLS_MAX_WEIGHT)
-        return shipping, f"GLS delivery: €{shipping:.2f}"
+        return IDF_DELIVERY_FEE, f"Livraison Île-de-France : {IDF_DELIVERY_FEE:.2f}€"
+    shipping = GLS_BASE + GLS_PER_KG * min(total_weight, GLS_MAX_WEIGHT)
+    return shipping, f"Livraison GLS : {GLS_BASE:.2f}€ + {GLS_PER_KG:.2f}€/kg = {shipping:.2f}€"
 
 
 # ── Payment ────────────────────────────────────────────────────────────────────
@@ -640,27 +700,51 @@ async def handle_payment_response(phone: str, text: str):
     total      = pending["total"]
     choice     = text.strip()
 
-    if choice == "1":
-        await send_whatsapp(phone, f"✅ *Card on delivery* for {order_name}.\nTotal: €{total:.2f}\n\nThank you! 🙏")
-        await send_whatsapp(ADMIN_PHONE, f"💳 {order_name}: *Card on delivery* — €{total:.2f}")
-    elif choice == "2":
-        await send_whatsapp(phone, f"✅ *Cash on delivery* for {order_name}.\nTotal: €{total:.2f}\n\nThank you! 🙏")
-        await send_whatsapp(ADMIN_PHONE, f"💵 {order_name}: *Cash on delivery* — €{total:.2f}")
-    elif choice == "3":
-        await send_whatsapp(phone, "⏳ Generating your payment link...")
+    idf_flag = pending.get("idf", False)
+    dept     = (pending.get("postal_code", "") or "")[:2]
+    is_77    = dept == "77"
+    address  = pending.get("address", "")
+
+    async def send_mollie():
+        await send_whatsapp(phone, "⏳ Génération du lien de paiement...")
         payment_url = await create_mollie_payment(order_name, total, phone)
         if payment_url:
             await send_whatsapp(phone,
-                f"💳 *Payment link for {order_name}*\n\nTotal: €{total:.2f}\n\n"
-                f"👉 {payment_url}\n\nThis link expires in 24 hours."
+                f"💳 *Lien de paiement — {order_name}*\n\n"
+                f"Total : {total:.2f}€\n\n"
+                f"👉 {payment_url}\n\n_Ce lien expire dans 24h._"
             )
-            await send_whatsapp(ADMIN_PHONE, f"🔗 {order_name}: Payment link sent — €{total:.2f}")
+            await send_whatsapp(ADMIN_PHONE,
+                f"🔗 {order_name} — Mollie envoyé — {total:.2f}€\n📍 {address}"
+            )
         else:
-            await send_whatsapp(phone, "Sorry, we could not generate the payment link. Our team will send it shortly.")
-            await send_whatsapp(ADMIN_PHONE, f"⚠️ {order_name}: Could not generate Mollie link — €{total:.2f}\nPlease send manually.")
+            await send_whatsapp(phone, "Désolé, nous n'avons pas pu générer le lien. Notre équipe vous le fera parvenir.")
+            await send_whatsapp(ADMIN_PHONE, f"⚠️ {order_name} : Erreur Mollie — {total:.2f}€\nEnvoyer manuellement.")
+
+    if idf_flag or is_77:
+        # IDF + 77 : livraison ou Mollie
+        if choice == "1":
+            await send_whatsapp(phone,
+                f"✅ *Paiement à la livraison* — {order_name}\n"
+                f"Total : {total:.2f}€\n\nMerci ! 🙏"
+            )
+            await send_whatsapp(ADMIN_PHONE,
+                f"💵 {order_name} — *Paiement livraison* — {total:.2f}€\n📍 {address}"
+            )
+        elif choice == "2":
+            await send_mollie()
+        else:
+            await send_whatsapp(phone,
+                "Veuillez répondre :\n1️⃣ Paiement à la livraison\n2️⃣ Paiement en ligne (lien Mollie)"
+            )
+            waiting_for_payment[phone] = pending
     else:
-        await send_whatsapp(phone, "Please reply:\n1️⃣ Card on delivery\n2️⃣ Cash on delivery\n3️⃣ Payment link")
-        waiting_for_payment[phone] = pending
+        # Hors IDF : Mollie uniquement
+        if choice == "1":
+            await send_mollie()
+        else:
+            await send_whatsapp(phone, "Veuillez répondre :\n1️⃣ Paiement en ligne (lien Mollie)")
+            waiting_for_payment[phone] = pending
 
 
 async def create_mollie_payment(order_name: str, amount: float, customer_phone: str):
