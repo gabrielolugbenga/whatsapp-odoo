@@ -559,6 +559,16 @@ async def finalize_client_order(phone: str, contact: str):
             "address":     address,
         }
 
+        # Notification admin — toujours
+        await send_whatsapp(ADMIN_PHONE,
+            f"🛒 *New order — {order_name}*\n"
+            f"👤 {delivery_name} ({contact} / {phone})\n"
+            f"📍 {address}\n\n"
+            f"{items_txt}\n\n"
+            f"🚚 Delivery: {order_data['shipping_cost']:.2f}€\n"
+            f"💰 Total: {grand_total:.2f}€"
+        )
+
         if idf_flag or is_77:
             await send_whatsapp(phone,
                 f"✅ *Order confirmed — {order_name}*\n\n{items_txt}\n\n"
@@ -586,11 +596,10 @@ async def finalize_client_order(phone: str, contact: str):
                     f"Total: {grand_total:.2f}€\n\n"
                     f"👉 {payment_url}\n\n_This link expires in 24h._"
                 )
-                await send_whatsapp(ADMIN_PHONE,
-                    f"🔗 {order_name} — Mollie sent — {grand_total:.2f}€"
-                )
+                await send_whatsapp(ADMIN_PHONE, f"🔗 {order_name} — Mollie sent — {grand_total:.2f}€")
             else:
                 await send_whatsapp(phone, "Sorry, we could not generate the payment link. Our team will send it shortly.")
+                await send_whatsapp(ADMIN_PHONE, f"⚠️ {order_name} — Mollie error, send manually.")
             waiting_for_payment.pop(phone, None)
             return
 
