@@ -4041,11 +4041,34 @@ async def catalog_feed():
         output = io.StringIO()
         writer = csv.writer(output)
         writer.writerow(['id', 'title', 'description', 'price', 'currency', 'image_url', 'brand', 'condition', 'availability', 'google_product_category', 'link'])
+        # Récupérer les taxes en une seule requête
+        product_ids = [p['id'] for p in products]
+        tax_data = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD, 'product.template', 'read',
+            [product_ids], {'fields': ['id', 'taxes_id']}
+        )
+        tax_map = {t['id']: t.get('taxes_id', []) for t in tax_data}
+
+        # Récupérer tous les taux de taxe uniques
+        all_tax_ids = list({tid for ids in tax_map.values() for tid in ids})
+        tax_rates = {}
+        if all_tax_ids:
+            taxes = models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD, 'account.tax', 'read',
+                [all_tax_ids], {'fields': ['id', 'amount', 'amount_type']}
+            )
+            tax_rates = {t['id']: t['amount'] / 100 for t in taxes if t.get('amount_type') == 'percent'}
+
         for p in products:
             product_id = p.get('default_code') or str(p['id'])
             title = p.get('name', '')
             description = p.get('description_sale') or title
-            price = f"{float(p.get('list_price', 0)):.2f}"
+            price_ht = float(p.get('list_price', 0))
+            # Calculer TTC
+            p_tax_ids = tax_map.get(p['id'], [])
+            tax_rate = sum(tax_rates.get(tid, 0) for tid in p_tax_ids)
+            price_ttc = round(price_ht * (1 + tax_rate), 2)
+            price = f"{price_ttc:.2f}"
             image_url = f"https://web-production-9581a.up.railway.app/product-image/{p['id']}?v=3"
             category = (p.get('categ_id') or [0, 'General'])[1]
             product_link = f"{ODOO_URL}/shop/product/{p['id']}"
