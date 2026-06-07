@@ -564,8 +564,8 @@ async def handle_catalog_order(phone: str, contact: str, order: dict):
         bags        = p.get("quantity", 1)
         price       = p.get("item_price", 0)
 
-        # Search by retailer ID or name
-        matches = find_products(models, uid, retailer_id, None)
+        # Search by retailer_id (default_code) first, then by name
+        matches = find_products_by_sku(models, uid, retailer_id) or find_products(models, uid, retailer_id, None)
         if matches:
             prod       = matches[0]
             price_ttc  = get_price_ttc(models, uid, prod["id"], prod["list_price"])
@@ -1243,6 +1243,19 @@ def odoo_login():
     if not uid:
         raise RuntimeError("Odoo auth failed")
     return xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object"), uid
+
+
+def find_products_by_sku(models, uid, sku: str) -> list:
+    """Search product by default_code (SKU/retailer_id)."""
+    try:
+        ids = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "product.template", "search",
+                                [[["default_code", "=", sku], ["sale_ok", "=", True]]], {"limit": 1})
+        if not ids:
+            return []
+        return models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "product.template", "read",
+                                 [ids], {"fields": ["id", "name", "list_price", "weight"]})
+    except Exception:
+        return []
 
 
 def find_products(models, uid, name: str, size: str = None) -> list:
