@@ -211,7 +211,7 @@ async def handle_new_client_message(phone: str, contact: str, text: str):
 
     if result.get("type") != "order" or not result.get("items"):
         # Not an order — show catalogue + friendly message
-        if first_time:
+        if True:
             await send_whatsapp(phone,
                 f"Hi {contact}! 👋 Welcome to Africomfort Foods!\n\n"
                 f"🛒 *Order easily via our catalogue:*\n{CATALOGUE_LINK}\n\n"
