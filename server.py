@@ -187,17 +187,21 @@ async def handle_new_client_message(phone: str, contact: str, text: str):
     """First message or no active session — always show welcome."""
     seen_customers.add(phone)
 
+    if phone in seen_customers:
+        return
+    seen_customers.add(phone)
+
     await send_whatsapp(phone,
-        f"Bonjour {contact} 👋\n\n"
-        "Je suis le bot de commande *Africomfort Foods* 🤖\n\n"
-        "📦 *Pour passer commande :*\n"
-        f"Parcourez notre catalogue et sélectionnez vos produits :\n"
+        f"Hi {contact} 👋\n\n"
+        "I am the *Africomfort Foods* order bot 🤖\n\n"
+        "📦 *To place an order:*\n"
+        f"Browse our catalogue and select your products:\n"
         f"🛒 {CATALOGUE_LINK}\n\n"
-        "✅ Une fois votre sélection faite, je vous demanderai votre adresse "
-        "et le mode de paiement avant de confirmer.\n\n"
-        "📞 *Besoin de parler à quelqu\'un ?*\n"
-        "Appelez-nous au *0660 56 51 29*\n\n"
-        "_Ce numéro est géré par un robot — les messages texte ne sont pas traités par un humain._"
+        "✅ Once you have made your selection, I will ask for your delivery address "
+        "and payment method before confirming.\n\n"
+        "📞 *Need to speak to someone?*\n"
+        "Call us on *0660 56 51 29*\n\n"
+        "_This number is managed by a robot — text messages are not read by a human._"
     )
 
     # Analyze message (commandes texte éventuelles)
