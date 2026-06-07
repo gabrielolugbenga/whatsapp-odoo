@@ -1290,10 +1290,14 @@ def odoo_login():
 
 
 def find_products_by_sku(models, uid, sku: str) -> list:
-    """Search product by default_code (SKU/retailer_id)."""
+    """Search product by default_code (SKU) or by numeric Odoo ID."""
     try:
+        # Try default_code first
         ids = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "product.template", "search",
                                 [[["default_code", "=", sku], ["sale_ok", "=", True]]], {"limit": 1})
+        # If SKU is numeric, try direct ID lookup
+        if not ids and sku.isdigit():
+            ids = [int(sku)]
         if not ids:
             return []
         return models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "product.template", "read",
