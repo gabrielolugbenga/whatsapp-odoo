@@ -560,18 +560,39 @@ async def finalize_client_order(phone: str, contact: str):
         }
 
         if idf_flag or is_77:
-            payment_options = "1️⃣ Cash on delivery\n2️⃣ Online payment (Mollie link)"
+            await send_whatsapp(phone,
+                f"✅ *Order confirmed — {order_name}*\n\n{items_txt}\n\n"
+                f"📍 Delivery address: {address}\n"
+                f"🚚 Delivery fee: {order_data['shipping_cost']:.2f}€\n"
+                f"💰 *Total: {grand_total:.2f}€*\n\n"
+                "How would you like to pay?\n"
+                "1️⃣ Cash on delivery\n"
+                "2️⃣ Online payment (Mollie link)\n\n"
+                "Reply with 1 or 2."
+            )
         else:
-            payment_options = "1️⃣ Online payment (Mollie link)"
-
-        await send_whatsapp(phone,
-            f"✅ *Order confirmed — {order_name}*\n\n{items_txt}\n\n"
-            f"📍 Delivery address: {address}\n"
-            f"🚚 Delivery fee: {order_data['shipping_cost']:.2f}€\n"
-            f"💰 *Total: {grand_total:.2f}€*\n\n"
-            f"How would you like to pay?\n{payment_options}\n\n"
-            "Reply with 1 or 2."
-        )
+            # Hors IDF — Mollie uniquement, envoyer directement
+            await send_whatsapp(phone,
+                f"✅ *Order confirmed — {order_name}*\n\n{items_txt}\n\n"
+                f"📍 Delivery address: {address}\n"
+                f"🚚 Delivery fee: {order_data['shipping_cost']:.2f}€\n"
+                f"💰 *Total: {grand_total:.2f}€*\n\n"
+                "⏳ Generating your payment link..."
+            )
+            payment_url = await create_mollie_payment(order_name, grand_total, phone)
+            if payment_url:
+                await send_whatsapp(phone,
+                    f"💳 *Payment link — {order_name}*\n\n"
+                    f"Total: {grand_total:.2f}€\n\n"
+                    f"👉 {payment_url}\n\n_This link expires in 24h._"
+                )
+                await send_whatsapp(ADMIN_PHONE,
+                    f"🔗 {order_name} — Mollie sent — {grand_total:.2f}€"
+                )
+            else:
+                await send_whatsapp(phone, "Sorry, we could not generate the payment link. Our team will send it shortly.")
+            waiting_for_payment.pop(phone, None)
+            return
 
     except Exception as e:
         log.error("Order creation error: %s", e)
@@ -652,11 +673,11 @@ def calculate_shipping(idf: bool, total_amount: float, total_weight: float, post
     """
     dept = (postal_code or "")[:2]
     if dept == "77":
-        return DEPT77_DELIVERY_FEE, f"Livraison Seine-et-Marne (77) : {DEPT77_DELIVERY_FEE:.2f}€"
+        return DEPT77_DELIVERY_FEE, f"Delivery fee: {DEPT77_DELIVERY_FEE:.2f}€"
     if idf:
-        return IDF_DELIVERY_FEE, f"Livraison Île-de-France : {IDF_DELIVERY_FEE:.2f}€"
+        return IDF_DELIVERY_FEE, f"Delivery fee: {IDF_DELIVERY_FEE:.2f}€"
     shipping = GLS_BASE + GLS_PER_KG * min(total_weight, GLS_MAX_WEIGHT)
-    return shipping, f"Livraison GLS : {GLS_BASE:.2f}€ + {GLS_PER_KG:.2f}€/kg = {shipping:.2f}€"
+    return shipping, f"Delivery fee: {shipping:.2f}€"
 
 
 # ── Payment ────────────────────────────────────────────────────────────────────
@@ -708,12 +729,8 @@ async def handle_payment_response(phone: str, text: str):
             )
             waiting_for_payment[phone] = pending
     else:
-        # Outside IDF — Mollie only
-        if choice == "1":
-            await send_mollie()
-        else:
-            await send_whatsapp(phone, "Please reply:\n1️⃣ Online payment (Mollie link)")
-            waiting_for_payment[phone] = pending
+        # Outside IDF — Mollie only, send directly
+        await send_mollie()
 
 
 async def create_mollie_payment(order_name: str, amount: float, customer_phone: str):
