@@ -667,17 +667,33 @@ def client_clarification_msg(amb: dict) -> str:
 def calculate_shipping(idf: bool, total_amount: float, total_weight: float, postal_code: str = "") -> tuple:
     """
     Frais de livraison :
-    - Dept 77 (Seine-et-Marne) : 10€ fixe
-    - IDF hors 77              : 3€ fixe
-    - Autres départements      : 9€ + 0,65€/kg
+    - Dept 77 : >=100€ → 10€ | <100€ → GLS
+    - IDF hors 77 : >=100€ → 3€ | <100€ → GLS
+    - Autres : GLS toujours
     """
-    dept = (postal_code or "")[:2]
+    dept   = (postal_code or "")[:2]
+    gls    = GLS_BASE + GLS_PER_KG * min(total_weight, GLS_MAX_WEIGHT)
+    needed = IDF_FREE_DELIVERY_THRESHOLD - total_amount
+
     if dept == "77":
-        return DEPT77_DELIVERY_FEE, f"Delivery fee: {DEPT77_DELIVERY_FEE:.2f}€"
+        if total_amount >= IDF_FREE_DELIVERY_THRESHOLD:
+            return DEPT77_DELIVERY_FEE, f"Delivery fee: {DEPT77_DELIVERY_FEE:.2f}€"
+        else:
+            return gls, (
+                f"Delivery fee: {gls:.2f}€\n"
+                f"💡 _Add {needed:.2f}€ more and delivery drops to {DEPT77_DELIVERY_FEE:.2f}€!_"
+            )
+
     if idf:
-        return IDF_DELIVERY_FEE, f"Delivery fee: {IDF_DELIVERY_FEE:.2f}€"
-    shipping = GLS_BASE + GLS_PER_KG * min(total_weight, GLS_MAX_WEIGHT)
-    return shipping, f"Delivery fee: {shipping:.2f}€"
+        if total_amount >= IDF_FREE_DELIVERY_THRESHOLD:
+            return IDF_DELIVERY_FEE, f"Delivery fee: {IDF_DELIVERY_FEE:.2f}€"
+        else:
+            return gls, (
+                f"Delivery fee: {gls:.2f}€\n"
+                f"💡 _Add {needed:.2f}€ more and delivery drops to {IDF_DELIVERY_FEE:.2f}€!_"
+            )
+
+    return gls, f"Delivery fee: {gls:.2f}€"
 
 
 # ── Payment ────────────────────────────────────────────────────────────────────
