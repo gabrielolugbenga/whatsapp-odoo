@@ -251,6 +251,31 @@ async def handle_client_session(phone: str, contact: str, text: str):
     if step == "clarification":
         await handle_client_clarification(phone, contact, text)
 
+    elif step == "ask_name":
+        session["delivery_name"] = text.strip()
+        session["step"] = "ask_address"
+        await send_whatsapp(phone,
+            "What is the *full delivery address*?\n"
+            "_(Street number, street, postcode, city)_"
+        )
+        return
+
+    elif step == "ask_address":
+        full_address = text.strip()
+        postal = re.search(r"\b(\d{5})\b", full_address)
+        if postal:
+            postcode = postal.group(1)
+            idf = postcode[:2] in IDF_PREFIXES
+        else:
+            postcode = ""
+            idf = False
+        session["address"]     = full_address
+        session["postal_code"] = postcode
+        session["idf"]         = idf
+        save_customer_idf(phone, idf)
+        await show_order_recap(phone, contact)
+        return
+
     elif step == "address":
         session["address"] = text.strip()
         await show_order_recap(phone, contact)
@@ -462,8 +487,10 @@ async def show_order_recap(phone: str, contact: str):
     else:
         lines = "  (no products found)"
 
+    delivery_name = session.get("delivery_name", contact)
     msg  = f"🛒 *Order summary:*\n\n{lines}\n\n"
-    msg += f"📍 Delivery: {address}\n"
+    msg += f"👤 Name: {delivery_name}\n"
+    msg += f"📍 Address: {address}\n"
     msg += f"🚚 {shipping_note}\n"
     msg += f"💰 *Total: {grand_total:.2f}€*\n\n"
     msg += "Reply *OK* to confirm or *CANCEL* to cancel."
@@ -511,9 +538,11 @@ async def finalize_client_order(phone: str, contact: str):
         dept     = (postcode or "")[:2]
         is_77    = dept == "77"
 
+        delivery_name = session.get("delivery_name", contact)
         await send_whatsapp(ADMIN_PHONE,
             f"✅ *New order — {order_name}*\n"
             f"Customer: {contact} ({phone})\n"
+            f"👤 Delivery name: {delivery_name}\n"
             f"📍 Address: {address or 'Not provided'}\n\n"
             f"{items_txt}\n\n"
             f"🚚 Delivery: {order_data['shipping_cost']:.2f}€\n"
@@ -578,42 +607,24 @@ async def handle_catalog_order(phone: str, contact: str, order: dict):
                 "line_total": line_total, "weight": prod.get("weight", 0),
             })
 
-    idf = get_customer_idf(phone)
-
-    if idf is None:
-        # Ask postal code
-        client_sessions[phone] = {
-            "step": "idf",
-            "contact": contact,
-            "order_data": {"items": []},
-            "resolved_items": resolved_items,
-            "unresolved": [],
-            "total_amount": total_amount,
-            "total_weight": total_weight,
-            "idf": None,
-            "idf_known": False,
-        }
-        await send_whatsapp(phone,
-            "Thank you for your order! 🛒\n\nWhat is your delivery postal code? (e.g. 75001, 92100...)"
-        )
-    else:
-        shipping_cost, shipping_note = calculate_shipping(idf, total_amount, total_weight)
-        grand_total = total_amount + shipping_cost
-
-        client_sessions[phone] = {
-            "step": "confirm",
-            "contact": contact,
-            "order_data": {"items": []},
-            "resolved_items": resolved_items,
-            "unresolved": [],
-            "total_amount": total_amount,
-            "total_weight": total_weight,
-            "shipping_cost": shipping_cost,
-            "grand_total": grand_total,
-            "idf": idf,
-            "idf_known": True,
-        }
-        await show_order_recap(phone, contact)
+    # Toujours demander nom + adresse avant le récap
+    client_sessions[phone] = {
+        "step":           "ask_name",
+        "contact":        contact,
+        "order_data":     {"items": []},
+        "resolved_items": resolved_items,
+        "unresolved":     [],
+        "total_amount":   total_amount,
+        "total_weight":   total_weight,
+        "idf":            None,
+        "postal_code":    "",
+        "address":        "",
+        "delivery_name":  "",
+    }
+    await send_whatsapp(phone,
+        "Thank you for your order! 🛒\n\n"
+        "What is the *full name* for delivery?"
+    )
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
